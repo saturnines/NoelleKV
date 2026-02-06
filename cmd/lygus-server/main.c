@@ -176,6 +176,9 @@ static void on_tick(event_loop_t *loop, void *data) {
 // Wrap the glue apply_entry to also notify server
 static int apply_entry_wrapper(void *ctx, uint64_t index, uint64_t term,
                                 raft_entry_type_t type, const void *data, size_t len) {
+
+	printf("[DEBUG] apply index=%lu len=%zu byte0=0x%02X\n",
+           index, len, (data && len > 0) ? ((const uint8_t*)data)[0] : 0);
     // Try DAG batch path first (entry starts with 0xDA)
     if (g_app.server && data && len > 0 && ((const uint8_t *)data)[0] == 0xDA) {
         if (server_try_apply_entry(g_app.server, (const uint8_t *)data, len) == 0) {

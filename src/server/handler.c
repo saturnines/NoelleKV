@@ -381,39 +381,28 @@ int handler_apply_dag_batch(handler_t *h, const uint8_t *entry, size_t len) {
 // DAG Batch Proposal
 // ============================================================================
 
-/**
- * Serialize current DAG and propose as a Raft entry.
- * Leader only. Called before ALR read to ensure pending writes
- * are included in the next commit.
- *
- * @return 0 on success, -1 on error or empty DAG
- */
-static int propose_dag_batch(handler_t *h) {
-    // Don't re-propose while a batch is already in the Raft pipeline
+static uint64_t propose_dag_batch(handler_t *h) {
     if (h->dag_propose_pending) return 0;
 
     size_t count = dag_count(h->dag);
-    if (count == 0) return -1;  // Nothing to propose
+    if (count == 0) return 0;
 
-    // Serialize: [0xDA][batch_payload]
     h->batch_buf[0] = DAG_ENTRY_MARKER;
-
     ssize_t batch_len = dag_serialize_batch(h->dag, h->batch_buf + 1,
                                              h->batch_buf_cap - 1);
-    if (batch_len < 0) return -1;
+    if (batch_len < 0) return 0;
 
     size_t entry_len = 1 + (size_t)batch_len;
 
-    // Propose to Raft
     int ret = raft_propose(h->raft, h->batch_buf, entry_len);
-    if (ret != 0) return -1;
+    if (ret != 0) return 0;
 
-    // Success — the batch is now in the Raft log pipeline.
     dag_reset(h->dag);
     h->dag_propose_pending = true;
-
     h->stats.dag_batches_proposed++;
-    return 0;
+
+    // Return the index of the entry we just proposed
+    return raft_get_pending_index(h->raft);
 }
 
 // ============================================================================
@@ -499,22 +488,22 @@ static void handle_get(handler_t *h, conn_t *conn, const request_t *req) {
         return;
     }
 
-    // If we're the leader and DAG has uncommitted writes, propose the
-    // batch now. The subsequent ALR ReadIndex will return a commit_index
-    // that includes this batch, ensuring the read sees all pending writes.
     if (raft_is_leader(h->raft) && dag_count(h->dag) > 0) {
+        printf("[DEBUG] DAG has %zu nodes, proposing batch\n", dag_count(h->dag));
         propose_dag_batch(h);
     }
 
-    // ALR linearizable read
+    uint64_t pending = raft_get_pending_index(h->raft);
+    printf("[DEBUG] pending=%lu commit=%lu applied=%lu\n",
+           pending, raft_get_commit_index(h->raft), raft_get_last_applied(h->raft));
+
     uint64_t now_ms = event_loop_now_ms(h->loop);
     lygus_err_t err = alr_read(h->alr, req->key, req->klen, conn, now_ms);
 
     if (err == LYGUS_OK) {
-        return;  // Response via ALR callback
+        return;
     }
 
-    // ALR failed
     int n;
     if (err == LYGUS_ERR_TRY_LEADER) {
         int leader = raft_get_leader_id(h->raft);
