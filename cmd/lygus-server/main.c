@@ -176,10 +176,18 @@ static void on_tick(event_loop_t *loop, void *data) {
 // Wrap the glue apply_entry to also notify server
 static int apply_entry_wrapper(void *ctx, uint64_t index, uint64_t term,
                                 raft_entry_type_t type, const void *data, size_t len) {
-    // First, apply to storage via glue
+    // Try DAG batch path first (entry starts with 0xDA)
+    if (g_app.server && data && len > 0) {
+        if (server_try_apply_entry(g_app.server, (const uint8_t *)data, len) == 0) {
+
+            server_on_commit(g_app.server, index, term);
+            return 0;
+        }
+    }
+
+    // Legacy apply path (regular PUT/DEL entries)
     int ret = glue_apply_entry(ctx, index, term, type, data, len);
 
-    // Then notify server of commit
     if (ret == 0 && g_app.server) {
         server_on_commit(g_app.server, index, term);
     }
