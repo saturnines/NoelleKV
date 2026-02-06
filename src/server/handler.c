@@ -395,6 +395,7 @@ static int propose_dag_batch(handler_t *h) {
 
     // Propose to Raft
     int ret = raft_propose(h->raft, h->batch_buf, entry_len);
+    printf("[PROPOSE] raft_propose returned %d, entry_len=%zu\n", ret, entry_len);
     if (ret != 0) return -1;
 
     h->stats.dag_batches_proposed++;
@@ -488,9 +489,9 @@ static void handle_get(handler_t *h, conn_t *conn, const request_t *req) {
     // batch now. The subsequent ALR ReadIndex will return a commit_index
     // that includes this batch, ensuring the read sees all pending writes.
     if (raft_is_leader(h->raft) && dag_count(h->dag) > 0) {
-        propose_dag_batch(h);
-        // If propose fails, that's OK — the read proceeds anyway.
-        // The writes will be included in a future batch.
+        printf("[TICK] leader proposing batch, dag_count=%zu\n", dag_count(h->dag));
+        int rc = propose_dag_batch(h);
+        printf("[TICK] propose result=%d\n", rc);
     }
 
     // ALR linearizable read (works on leader or follower)
