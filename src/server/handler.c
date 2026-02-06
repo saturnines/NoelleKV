@@ -100,6 +100,9 @@ struct handler {
     uint8_t         *node_push_buf;    // For push-on-write serialization
     size_t           node_push_cap;
 
+    // DAG commit state
+    bool             dag_propose_pending;  // true while a batch is in Raft pipeline
+
     // Stats
     handler_stats_t  stats;
 };
@@ -366,6 +369,11 @@ int handler_apply_dag_batch(handler_t *h, const uint8_t *entry, size_t len) {
     // nodes are harmless no-ops if they reappear.
 
     h->stats.dag_batches_applied++;
+
+    // Batch is now fully applied to the KV state machine.
+    // Clear the in-flight flag so the next tick/read can propose again.
+    h->dag_propose_pending = false;
+
     return count;
 }
 
@@ -381,6 +389,9 @@ int handler_apply_dag_batch(handler_t *h, const uint8_t *entry, size_t len) {
  * @return 0 on success, -1 on error or empty DAG
  */
 static int propose_dag_batch(handler_t *h) {
+    // Don't re-propose while a batch is already in the Raft pipeline
+    if (h->dag_propose_pending) return 0;
+
     size_t count = dag_count(h->dag);
     if (count == 0) return -1;  // Nothing to propose
 
@@ -395,8 +406,11 @@ static int propose_dag_batch(handler_t *h) {
 
     // Propose to Raft
     int ret = raft_propose(h->raft, h->batch_buf, entry_len);
-    printf("[PROPOSE] raft_propose returned %d, entry_len=%zu\n", ret, entry_len);
     if (ret != 0) return -1;
+
+    // Success — the batch is now in the Raft log pipeline.
+    dag_reset(h->dag);
+    h->dag_propose_pending = true;
 
     h->stats.dag_batches_proposed++;
     return 0;
@@ -489,12 +503,10 @@ static void handle_get(handler_t *h, conn_t *conn, const request_t *req) {
     // batch now. The subsequent ALR ReadIndex will return a commit_index
     // that includes this batch, ensuring the read sees all pending writes.
     if (raft_is_leader(h->raft) && dag_count(h->dag) > 0) {
-        printf("[TICK] leader proposing batch, dag_count=%zu\n", dag_count(h->dag));
-        int rc = propose_dag_batch(h);
-        printf("[TICK] propose result=%d\n", rc);
+        propose_dag_batch(h);
     }
 
-    // ALR linearizable read (works on leader or follower)
+    // ALR linearizable read
     uint64_t now_ms = event_loop_now_ms(h->loop);
     lygus_err_t err = alr_read(h->alr, req->key, req->klen, conn, now_ms);
 
@@ -724,9 +736,9 @@ void handler_on_leadership_change(handler_t *h, bool is_leader) {
     if (!is_leader) {
         pending_fail_all(h->pending, LYGUS_ERR_NOT_LEADER);
         alr_on_term_change(h->alr, raft_get_term(h->raft));
-        // Note: DAG is NOT cleared on leadership change.
-        // Gossip continues replicating. The new leader will
-        // pick up our nodes and include them in the next batch.
+        // Clear in-flight flag — the new leader may re-commit our
+
+        h->dag_propose_pending = false;
     }
 }
 
@@ -738,6 +750,7 @@ void handler_on_term_change(handler_t *h, uint64_t new_term) {
 void handler_on_log_truncate(handler_t *h, uint64_t from_index) {
     if (!h) return;
     pending_fail_from(h->pending, from_index, LYGUS_ERR_LOG_MISMATCH);
+    h->dag_propose_pending = false;
 }
 
 void handler_on_conn_close(handler_t *h, conn_t *conn) {
