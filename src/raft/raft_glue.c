@@ -8,6 +8,7 @@
 #include "platform/platform.h"
 #include "public/lygus_errors.h"
 #include "../state/kv_op.h"
+#include "server/server.h"
 
 #include <stdlib.h>
 #include <string.h>
