@@ -34,6 +34,10 @@
 #include "../util/logging.h"
 #include "../state/kv_op.h"
 
+
+static const uint8_t DAG_WAL_KEY[] = "__dag__";
+#define DAG_WAL_KEY_LEN 7
+
 // ============================================================================
 // Internal Structure
 // ============================================================================
@@ -393,16 +397,19 @@ int storage_mgr_log_raw(storage_mgr_t *mgr,
         return LYGUS_ERR_OUT_OF_ORDER;
     }
 
-    // DAG batch (0xDA prefix) - store as NOOP, KV apply happens later
+    // DAG batch (0xDA prefix) - store as PUT with sentinel key
     if (((const uint8_t *)data)[0] == 0xDA) {
-        int ret = wal_noop_sync(mgr->wal, index, term);
+        int ret = wal_put(mgr->wal, index, term,
+                          DAG_WAL_KEY, DAG_WAL_KEY_LEN,
+                          data, len);
         if (ret != LYGUS_OK) return ret;
-        mgr->wal_bytes_written += 20;
+        mgr->wal_bytes_written += 32 + DAG_WAL_KEY_LEN + len;
         mgr->logged_index = index;
         mgr->logged_term = term;
         return LYGUS_OK;
     }
 
+    // Legacy KV entries
     kv_op_type_t op_type;
     const void *key, *val;
     uint32_t klen, vlen;
@@ -1090,6 +1097,17 @@ ssize_t storage_mgr_log_get(storage_mgr_t *mgr, uint64_t index,
     if (term_out) {
         *term_out = entry.term;
     }
+
+    // DAG BATCH
+    if (entry.type == WAL_ENTRY_PUT &&
+            entry.klen == DAG_WAL_KEY_LEN &&
+            memcmp(entry.key, DAG_WAL_KEY, DAG_WAL_KEY_LEN) == 0) {
+        if (!buf || buf_cap < entry.vlen) {
+            return -(ssize_t)entry.vlen;
+        }
+        memcpy(buf, entry.val, entry.vlen);
+        return (ssize_t)entry.vlen;
+            }
 
     // Calculate serialized size: [type:1][klen:4][vlen:4][key][value]
     size_t klen = entry.klen;
