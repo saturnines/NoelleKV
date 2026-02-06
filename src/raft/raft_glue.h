@@ -11,7 +11,7 @@
 #include "raft.h"
 #include "storage/storage_mgr.h"
 #include "network/network.h"
-#include "dag_entry.h"
+#include "server/dag_entry.h"
 
 #ifdef __cplusplus
 extern "C" {
