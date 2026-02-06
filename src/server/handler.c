@@ -38,6 +38,7 @@
 #include "gossip.h"
 #include "dag_entry.h"
 
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -123,7 +124,7 @@ static int gossip_pick_peer_cb(void *ctx);
 static void apply_node_to_kv(dag_node_t *node, void *ctx);
 
 // Propose current DAG as a Raft batch entry (leader only)
-static int propose_dag_batch(handler_t *h);
+static uint64_t propose_dag_batch(handler_t *h);
 
 // Push a single node to all peers
 static void push_node_to_peers(handler_t *h, dag_node_t *node);
