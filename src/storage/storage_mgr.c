@@ -393,6 +393,16 @@ int storage_mgr_log_raw(storage_mgr_t *mgr,
         return LYGUS_ERR_OUT_OF_ORDER;
     }
 
+    // DAG batch (0xDA prefix) - store as NOOP, KV apply happens later
+    if (((const uint8_t *)data)[0] == 0xDA) {
+        int ret = wal_noop_sync(mgr->wal, index, term);
+        if (ret != LYGUS_OK) return ret;
+        mgr->wal_bytes_written += 20;
+        mgr->logged_index = index;
+        mgr->logged_term = term;
+        return LYGUS_OK;
+    }
+
     kv_op_type_t op_type;
     const void *key, *val;
     uint32_t klen, vlen;
