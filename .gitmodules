@@ -4,3 +4,6 @@
 [submodule "deps/lil-raft"]
 	path = deps/lil-raft
 	url = https://github.com/saturnines/lil-raft.git
+[submodule "deps/DAG"]
+	path = deps/DAG
+	url = https://github.com/saturnines/DAG.git
