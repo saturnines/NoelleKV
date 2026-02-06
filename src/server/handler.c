@@ -383,7 +383,10 @@ int handler_apply_dag_batch(handler_t *h, const uint8_t *entry, size_t len) {
 // ============================================================================
 
 static uint64_t propose_dag_batch(handler_t *h) {
-    if (h->dag_propose_pending) return 0;
+    if (h->dag_propose_pending) {
+        printf("[DEBUG] propose_dag_batch: already pending\n");
+        return 0;
+    }
 
     size_t count = dag_count(h->dag);
     if (count == 0) return 0;
@@ -391,21 +394,25 @@ static uint64_t propose_dag_batch(handler_t *h) {
     h->batch_buf[0] = DAG_ENTRY_MARKER;
     ssize_t batch_len = dag_serialize_batch(h->dag, h->batch_buf + 1,
                                              h->batch_buf_cap - 1);
+    printf("[DEBUG] dag_serialize_batch returned %zd\n", batch_len);
+
     if (batch_len < 0) return 0;
 
     size_t entry_len = 1 + (size_t)batch_len;
+    printf("[DEBUG] proposing entry len=%zu byte0=0x%02X\n",
+           entry_len, h->batch_buf[0]);
 
     int ret = raft_propose(h->raft, h->batch_buf, entry_len);
+    printf("[DEBUG] raft_propose returned %d\n", ret);
+
     if (ret != 0) return 0;
 
     dag_reset(h->dag);
     h->dag_propose_pending = true;
     h->stats.dag_batches_proposed++;
 
-    // Return the index of the entry we just proposed
     return raft_get_pending_index(h->raft);
 }
-
 // ============================================================================
 // Push-on-write Gossip
 // ============================================================================
