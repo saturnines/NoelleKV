@@ -458,7 +458,17 @@ int glue_apply_entry(void *ctx, uint64_t index, uint64_t term,
         return storage_mgr_apply_noop(g->storage, index, term);
     }
 
-    // Deserialize KV operation
+    // DAG PATH
+    if (g->server && dag_entry_is_batch(data, len)) {
+        int ret = server_try_apply_entry(g->server, data, len);
+        if (ret >= 0) {
+
+            return storage_mgr_apply_noop(g->storage, index, term);
+        }
+        // Fall through to legacy if server_try_apply_entry failed
+    }
+
+    // ---- Legacy KV path (unchanged) ----
     uint8_t entry_type;
     uint32_t klen, vlen;
     const void *key, *val;
@@ -483,7 +493,6 @@ int glue_apply_entry(void *ctx, uint64_t index, uint64_t term,
             return LYGUS_ERR_MALFORMED;
     }
 }
-
 // ============================================================================
 // Snapshot Callbacks
 // ============================================================================

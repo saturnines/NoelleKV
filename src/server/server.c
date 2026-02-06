@@ -1,11 +1,18 @@
 /**
- * server.c - TCP server implementation
+ * server.c - TCP server implementation with DAG integration
+ *
+ * Changes from original:
+ *   - Passes DAG config + network handle to handler
+ *   - server_tick drains gossip inbox and dispatches to handler
+ *   - server_try_apply_entry hooks DAG batch apply into glue layer
  */
 
 #include "server.h"
 #include "handler.h"
 #include "conn.h"
 #include "protocol.h"
+#include "network/network.h"
+#include "dag_entry.h"
 #include "event/event_loop.h"
 
 #include "platform/platform.h"
@@ -22,6 +29,8 @@
 #define DEFAULT_MAX_CONNECTIONS  1024
 #define DEFAULT_MAX_REQUEST      (1024 * 1024)
 #define DEFAULT_BUFFER_SIZE      4096
+#define GOSSIP_RECV_BUF_SIZE     65536
+#define MAX_GOSSIP_PER_TICK      64    // Don't starve the event loop
 
 // ============================================================================
 // Connection Tracking
@@ -43,6 +52,7 @@ struct server {
     raft_t          *raft;
     raft_glue_ctx_t *glue_ctx;
     storage_mgr_t   *storage;
+    network_t       *net;
 
     // Listen socket
     lygus_socket_t   listen_sock;
@@ -58,6 +68,9 @@ struct server {
 
     // Config for new connections
     conn_config_t    conn_cfg;
+
+    // Gossip recv buffer (owned)
+    uint8_t         *gossip_buf;
 
     // Stats
     uint64_t         conns_total;
@@ -126,7 +139,6 @@ server_t *server_create(const server_config_t *cfg) {
         return NULL;
     }
 
-    // Initialize platform sockets
     if (lygus_socket_init() < 0) {
         return NULL;
     }
@@ -138,11 +150,19 @@ server_t *server_create(const server_config_t *cfg) {
     srv->raft = cfg->raft;
     srv->glue_ctx = cfg->glue_ctx;
     srv->storage = cfg->storage;
+    srv->net = cfg->net;
     srv->port = cfg->port;
     srv->max_conns = cfg->max_connections > 0 ? (int)cfg->max_connections : DEFAULT_MAX_CONNECTIONS;
     srv->listen_sock = LYGUS_INVALID_SOCKET;
 
-    // Setup connection config
+    // Gossip recv buffer
+    srv->gossip_buf = malloc(GOSSIP_RECV_BUF_SIZE);
+    if (!srv->gossip_buf) {
+        free(srv);
+        return NULL;
+    }
+
+    // Connection config
     srv->conn_cfg.read_buf_init = cfg->initial_buffer_size > 0 ?
                                   cfg->initial_buffer_size : DEFAULT_BUFFER_SIZE;
     srv->conn_cfg.write_buf_init = srv->conn_cfg.read_buf_init;
@@ -152,24 +172,31 @@ server_t *server_create(const server_config_t *cfg) {
     srv->conn_cfg.on_close = on_conn_close;
     srv->conn_cfg.ctx = srv;
 
-    // Create handler
+    // Create handler with DAG config
     handler_config_t handler_cfg = {
         .loop = cfg->loop,
         .raft = cfg->raft,
         .glue_ctx = cfg->glue_ctx,
         .storage = cfg->storage,
         .kv = cfg->kv,
+        .net = cfg->net,
+        .node_id = cfg->node_id,
+        .num_peers = cfg->num_peers,
+        .dag_max_nodes = cfg->dag_max_nodes,
+        .dag_arena_size = cfg->dag_arena_size,
+        .batch_buf_size = cfg->batch_buf_size,
         .max_pending = cfg->max_pending,
         .request_timeout_ms = cfg->request_timeout_ms,
         .alr_capacity = cfg->alr_capacity,
         .alr_slab_size = cfg->alr_slab_size,
         .alr_timeout_ms = cfg->alr_timeout_ms,
-        .leader_only_reads = cfg->leader_only_reads,  // BENCHMARK SKIP ALR
+        .leader_only_reads = cfg->leader_only_reads,
         .version = cfg->version,
     };
 
     srv->handler = handler_create(&handler_cfg);
     if (!srv->handler) {
+        free(srv->gossip_buf);
         free(srv);
         return NULL;
     }
@@ -178,6 +205,7 @@ server_t *server_create(const server_config_t *cfg) {
     lygus_socket_t sock = lygus_socket_tcp();
     if (sock == LYGUS_INVALID_SOCKET) {
         handler_destroy(srv->handler);
+        free(srv->gossip_buf);
         free(srv);
         return NULL;
     }
@@ -188,6 +216,7 @@ server_t *server_create(const server_config_t *cfg) {
     if (lygus_socket_bind(sock, cfg->bind_addr, (uint16_t)cfg->port) < 0) {
         lygus_socket_close(sock);
         handler_destroy(srv->handler);
+        free(srv->gossip_buf);
         free(srv);
         return NULL;
     }
@@ -196,16 +225,17 @@ server_t *server_create(const server_config_t *cfg) {
     if (lygus_socket_listen(sock, backlog) < 0) {
         lygus_socket_close(sock);
         handler_destroy(srv->handler);
+        free(srv->gossip_buf);
         free(srv);
         return NULL;
     }
 
     srv->listen_sock = sock;
 
-    // Register accept handler
     if (event_loop_add(cfg->loop, lygus_socket_to_fd(sock), EV_READ, on_accept, srv) < 0) {
         lygus_socket_close(sock);
         handler_destroy(srv->handler);
+        free(srv->gossip_buf);
         free(srv);
         return NULL;
     }
@@ -216,7 +246,6 @@ server_t *server_create(const server_config_t *cfg) {
 void server_destroy(server_t *srv) {
     if (!srv) return;
 
-    // Close all connections
     while (srv->conns) {
         conn_node_t *node = srv->conns;
         handler_on_conn_close(srv->handler, node->conn);
@@ -224,15 +253,13 @@ void server_destroy(server_t *srv) {
         conn_list_remove(srv, node);
     }
 
-    // Close listen socket
     if (srv->listen_sock != LYGUS_INVALID_SOCKET) {
         event_loop_del(srv->loop, lygus_socket_to_fd(srv->listen_sock));
         lygus_socket_close(srv->listen_sock);
     }
 
-    // Destroy handler
     handler_destroy(srv->handler);
-
+    free(srv->gossip_buf);
     free(srv);
 }
 
@@ -251,12 +278,11 @@ static void on_accept(event_loop_t *loop, int fd, uint32_t events, void *data) {
                                                          addr_str, sizeof(addr_str));
 
         if (client_sock == LYGUS_INVALID_SOCKET) {
-            break;  // No more pending connections
+            break;
         }
 
         srv->conns_total++;
 
-        // Check connection limit
         if (srv->num_conns >= srv->max_conns) {
             lygus_socket_close(client_sock);
             srv->conns_rejected++;
@@ -302,11 +328,43 @@ static void on_conn_close(conn_t *conn, void *ctx) {
 }
 
 // ============================================================================
+// Gossip Drain (called from tick)
+// ============================================================================
+
+/**
+ * Drain gossip inbox and dispatch to handler.
+ *
+ * Processes up to MAX_GOSSIP_PER_TICK messages to avoid
+ * starving the event loop under high gossip load.
+ */
+static void drain_gossip(server_t *srv) {
+    if (!srv->net) return;
+
+    for (int i = 0; i < MAX_GOSSIP_PER_TICK; i++) {
+        int from_id = -1;
+        uint8_t msg_type = 0;
+
+        int len = network_recv_gossip(srv->net, &from_id, &msg_type,
+                                       srv->gossip_buf, GOSSIP_RECV_BUF_SIZE);
+
+        if (len <= 0) break;  // No more gossip messages
+
+        handler_on_gossip(srv->handler, from_id, msg_type,
+                          srv->gossip_buf, (size_t)len);
+    }
+}
+
+// ============================================================================
 // Event Hooks
 // ============================================================================
 
 void server_tick(server_t *srv, uint64_t now_ms) {
     if (!srv) return;
+
+    // Drain gossip inbox
+    drain_gossip(srv);
+
+    // Handler tick (timeouts, gossip anti-entropy)
     handler_tick(srv->handler, now_ms);
 }
 
@@ -341,6 +399,30 @@ void server_on_readindex_complete(server_t *srv, uint64_t req_id,
     handler_on_readindex_complete(srv->handler, req_id, read_index, err);
 }
 
+/**
+ * Try to apply a Raft log entry as a DAG batch.
+ *
+ * Call this from your glue layer's apply_entry callback:
+ *
+ *   void apply_entry(const uint8_t *entry, size_t len, void *ctx) {
+ *       server_t *srv = (server_t *)ctx;
+ *       if (server_try_apply_entry(srv, entry, len) == 0) {
+ *           return;  // DAG batch applied
+ *       }
+ *       // Legacy apply path (existing glue_deserialize_put/del)
+ *       ...
+ *   }
+ */
+int server_try_apply_entry(server_t *srv, const uint8_t *entry, size_t len) {
+    if (!srv || !entry) return -1;
+
+    if (!dag_entry_is_batch(entry, len)) {
+        return -1;  // Not a DAG batch, use legacy path
+    }
+
+    return handler_apply_dag_batch(srv->handler, entry, len);
+}
+
 // ============================================================================
 // Stats
 // ============================================================================
@@ -364,6 +446,11 @@ void server_get_stats(const server_t *srv, server_stats_t *out) {
     out->reads_total = h_stats.reads_total;
     out->writes_total = h_stats.writes_total;
     out->writes_pending = h_stats.writes_pending;
+
+    out->dag_inserts = h_stats.dag_inserts;
+    out->dag_batches_proposed = h_stats.dag_batches_proposed;
+    out->dag_batches_applied = h_stats.dag_batches_applied;
+    out->dag_node_count = h_stats.dag_node_count;
 }
 
 int server_connection_count(const server_t *srv) {

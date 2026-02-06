@@ -24,13 +24,28 @@ extern "C" {
         MSG_READINDEX_REQ        = 7,
         MSG_READINDEX_RESP       = 8,
 
-
         MSG_INV                 = 10,   // Invalidation broadcast
 
         // Control
         MSG_PING                = 20,
         MSG_PONG                = 21,
+
+        // ---- DAG gossip (maps to gossip.h constants) ----
+        MSG_GOSSIP_SYNC         = 30,   // GOSSIP_SYNC
+        MSG_GOSSIP_NEED_TIPS    = 31,   // GOSSIP_NEED_TIPS
+        MSG_GOSSIP_TIPS         = 32,   // GOSSIP_TIPS
+        MSG_GOSSIP_NEED_NODES   = 33,   // GOSSIP_NEED_NODES
+        MSG_GOSSIP_NODES        = 34,   // GOSSIP_NODES
+        MSG_DAG_PUSH            = 35,   // Push-on-write: single serialized node
+
     } msg_type_t;
+
+/**
+ * Check if message type is a gossip protocol message
+ */
+static inline int msg_is_gossip(uint8_t type) {
+    return type >= MSG_GOSSIP_SYNC && type <= MSG_DAG_PUSH;
+}
 
 // ============================================================================
 // Wire Header

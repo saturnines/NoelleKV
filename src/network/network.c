@@ -1,8 +1,11 @@
 /**
  * network.c - Network layer implementation
  *
- * Uses ZeroMQ for messaging with a background thread.
- * Inbox notification allows event-driven wakeup instead of polling.
+ * Uses ZeroMQ with a background thread.
+ *
+ * Change from original: incoming messages with types 30-35 (gossip)
+ * are routed to a separate gossip_inbox instead of the raft_inbox.
+ * This keeps Raft processing unblocked by gossip traffic.
  */
 
 #include "network.h"
@@ -38,22 +41,23 @@ struct network {
 
     // ZeroMQ
     void *zmq_ctx;
-    void *raft_router;              // ROUTER - receives Raft msgs
-    void *raft_dealers[MAX_PEERS];  // DEALER per peer - sends Raft msgs
-    void *inv_pub;                  // PUB - broadcasts INV
-    void *inv_sub;                  // SUB - receives INV from all
+    void *raft_router;
+    void *raft_dealers[MAX_PEERS];
+    void *inv_pub;
+    void *inv_sub;
 
     // Internal signaling (The Doorbell)
-    void *pipe_send;                // Main thread signals here
-    void *pipe_recv;                // Network thread listens here
+    void *pipe_send;
+    void *pipe_recv;
 
     // Mailboxes
-    mailbox_t *raft_inbox;   // Incoming Raft messages
-    mailbox_t *raft_outbox;  // Outgoing Raft messages
-    mailbox_t *inv_inbox;    // Incoming INV messages
+    mailbox_t *raft_inbox;     // Incoming Raft messages (types 1-21)
+    mailbox_t *raft_outbox;    // Outgoing Raft + gossip messages
+    mailbox_t *inv_inbox;      // Incoming INV messages
+    mailbox_t *gossip_inbox;   // Incoming gossip messages (types 30-35)  <-- NEW
 
     // Event loop notification
-    lygus_notify_t *inbox_notify;  // Signals main thread when inbox has data
+    lygus_notify_t *inbox_notify;
 
     // Thread
     pthread_t net_thread;
@@ -85,7 +89,7 @@ int network_load_peers(const char *path, peer_info_t *peers, int max_peers)
 
         int id;
         char addr[128];
-        int raft_port;  // <-- ADD THIS LINE
+        int raft_port;
 
         if (sscanf(line, "%d %127s %d", &id, addr, &raft_port) >= 3) {
             peers[count].id = id;
@@ -114,7 +118,7 @@ static void *network_thread_func(void *arg)
     uint8_t buf[65536];
 
     while (net->running) {
-        // 1. Drain outbox
+        // 1. Drain outbox (Raft + gossip messages share the same outbox)
         mail_t mail;
         while (mailbox_pop(net->raft_outbox, &mail) == 0) {
             int peer_id = mail.peer_id;
@@ -131,9 +135,8 @@ static void *network_thread_func(void *arg)
                 size_t wire_len = wire_encode(buf, mail.msg_type, net->node_id,
                                               mail.data, mail.len);
 
-                // ZMQ_DONTWAIT ensures we never block the event loop on sending
                 if (zmq_send(dealer, buf, wire_len, ZMQ_DONTWAIT) == -1) {
-                    // Fail silently on send error (Raft should retry)
+                    // Fail silently (Raft retries, gossip is best-effort)
                 }
             }
 
@@ -142,11 +145,11 @@ static void *network_thread_func(void *arg)
             }
         }
 
-        // 2. Poll for incoming (Traffic OR Doorbell)
+        // 2. Poll for incoming
         zmq_pollitem_t items[] = {
             { net->raft_router, 0, ZMQ_POLLIN, 0 },
             { net->inv_sub,     0, ZMQ_POLLIN, 0 },
-            { net->pipe_recv,   0, ZMQ_POLLIN, 0 }, // Check for wake-up signal
+            { net->pipe_recv,   0, ZMQ_POLLIN, 0 },
         };
 
         int rc = zmq_poll(items, 3, POLL_TIMEOUT_MS);
@@ -155,14 +158,13 @@ static void *network_thread_func(void *arg)
             break;
         }
 
-        // Check if we were woken up by the main thread
+        // Check doorbell
         if (items[2].revents & ZMQ_POLLIN) {
             uint8_t dummy[1];
             zmq_recv(net->pipe_recv, dummy, 1, ZMQ_DONTWAIT);
-            // No action needed, loop handles outbox drainage
         }
 
-        // 3. Receive Raft messages (ROUTER)
+        // 3. Receive messages (ROUTER) - route to raft or gossip inbox
         if (items[0].revents & ZMQ_POLLIN) {
             zmq_msg_t identity, data;
             zmq_msg_init(&identity);
@@ -190,13 +192,20 @@ static void *network_thread_func(void *arg)
                             .data = payload_copy,
                         };
 
-                        if (mailbox_push(net->raft_inbox, &incoming) == 0) {
-                            // Successfully pushed - notify main thread
+                        // Route based on message type
+                        mailbox_t *target;
+                        if (msg_is_gossip(hdr.type)) {
+                            target = net->gossip_inbox;    // <-- gossip
+                        } else {
+                            target = net->raft_inbox;      // <-- raft
+                        }
+
+                        if (mailbox_push(target, &incoming) == 0) {
                             if (net->inbox_notify) {
                                 lygus_notify_signal(net->inbox_notify);
                             }
                         } else {
-                            free(payload_copy); // Drop if inbox full, raft should retry
+                            free(payload_copy);
                         }
                     }
                 }
@@ -205,7 +214,7 @@ static void *network_thread_func(void *arg)
             zmq_msg_close(&data);
         }
 
-        // 4. Receive INV broadcasts (SUB)
+        // 4. Receive INV broadcasts (SUB) - unchanged
         if (items[1].revents & ZMQ_POLLIN) {
             int len = zmq_recv(net->inv_sub, buf, sizeof(buf), ZMQ_DONTWAIT);
             if (len >= WIRE_HEADER_SIZE) {
@@ -229,8 +238,6 @@ static void *network_thread_func(void *arg)
                     if (mailbox_push(net->inv_inbox, &incoming) != 0) {
                         free(key_copy);
                     }
-                    // Note: We don't notify for INV messages since they're
-                    // less latency-sensitive than Raft consensus messages
                 }
             }
         }
@@ -244,34 +251,29 @@ static void *network_thread_func(void *arg)
 
 network_t *network_create(const network_config_t *cfg)
 {
-    if (!cfg || !cfg->peers || cfg->num_peers <= 0) return NULL;
+    if (!cfg) return NULL;
 
     network_t *net = calloc(1, sizeof(network_t));
     if (!net) return NULL;
 
     net->node_id = cfg->node_id;
-    net->num_peers = cfg->num_peers;
-    memcpy(net->peers, cfg->peers, cfg->num_peers * sizeof(peer_info_t));
+    net->num_peers = cfg->num_peers < MAX_PEERS ? cfg->num_peers : MAX_PEERS;
+    memcpy(net->peers, cfg->peers, net->num_peers * sizeof(peer_info_t));
 
-    // Create inbox notification for event loop integration
-    net->inbox_notify = lygus_notify_create();
-    if (!net->inbox_notify) {
-        // Non-fatal: fall back to timer-based polling
-        fprintf(stderr, "Warning: couldn't create inbox notification, "
-                        "falling back to polling\n");
-    }
-
+    // ZMQ context
     net->zmq_ctx = zmq_ctx_new();
     if (!net->zmq_ctx) goto fail;
 
     int linger = 0;
 
-    // Create wake-up pipe
-    net->pipe_send = zmq_socket(net->zmq_ctx, ZMQ_PAIR);
-    net->pipe_recv = zmq_socket(net->zmq_ctx, ZMQ_PAIR);
+    // Notification
+    net->inbox_notify = lygus_notify_create();
+
+    // Internal pipe
+    net->pipe_send = zmq_socket(net->zmq_ctx, ZMQ_PUSH);
+    net->pipe_recv = zmq_socket(net->zmq_ctx, ZMQ_PULL);
     if (!net->pipe_send || !net->pipe_recv) goto fail;
 
-    // Bind unique inproc address per network instance
     char pipe_addr[64];
     snprintf(pipe_addr, sizeof(pipe_addr), "inproc://net_wakeup_%p", (void*)net);
 
@@ -284,7 +286,7 @@ network_t *network_create(const network_config_t *cfg)
     zmq_setsockopt(net->raft_router, ZMQ_LINGER, &linger, sizeof(linger));
 
     char bind_addr[256];
-    int my_raft_port = RAFT_PORT_BASE;  // fallback
+    int my_raft_port = RAFT_PORT_BASE;
     for (int i = 0; i < net->num_peers; i++) {
         if (net->peers[i].id == net->node_id) {
             my_raft_port = net->peers[i].raft_port;
@@ -313,8 +315,8 @@ network_t *network_create(const network_config_t *cfg)
         zmq_setsockopt(net->raft_dealers[i], ZMQ_IDENTITY, identity, strlen(identity));
 
         if (zmq_connect(net->raft_dealers[i], net->peers[i].raft_endpoint) != 0) {
-            // Log connection failure but don't abort creation (soft fail)
-            fprintf(stderr, "%s: %s\n", lygus_strerror(LYGUS_ERR_CONNECT), net->peers[i].raft_endpoint);
+            fprintf(stderr, "%s: %s\n", lygus_strerror(LYGUS_ERR_CONNECT),
+                    net->peers[i].raft_endpoint);
         }
     }
 
@@ -337,12 +339,15 @@ network_t *network_create(const network_config_t *cfg)
         zmq_connect(net->inv_sub, net->peers[i].inv_endpoint);
     }
 
+    // Mailboxes
     size_t mb_size = cfg->mailbox_size > 0 ? cfg->mailbox_size : 256;
     net->raft_inbox = mailbox_create(mb_size);
     net->raft_outbox = mailbox_create(mb_size);
     net->inv_inbox = mailbox_create(mb_size);
+    net->gossip_inbox = mailbox_create(mb_size);   // <-- NEW
 
-    if (!net->raft_inbox || !net->raft_outbox || !net->inv_inbox) goto fail;
+    if (!net->raft_inbox || !net->raft_outbox ||
+        !net->inv_inbox || !net->gossip_inbox) goto fail;
 
     return net;
 
@@ -371,6 +376,7 @@ void network_destroy(network_t *net)
     mailbox_destroy(net->raft_inbox);
     mailbox_destroy(net->raft_outbox);
     mailbox_destroy(net->inv_inbox);
+    mailbox_destroy(net->gossip_inbox);   // <-- NEW
     lygus_notify_destroy(net->inbox_notify);
 
     free(net);
@@ -392,7 +398,6 @@ void network_stop(network_t *net)
     if (!net || !net->running) return;
     net->running = 0;
 
-    // Wake up thread so it can exit
     if (net->pipe_send) zmq_send(net->pipe_send, "", 0, ZMQ_DONTWAIT);
 
     pthread_join(net->net_thread, NULL);
@@ -426,7 +431,7 @@ int network_send_raft(network_t *net, int peer_id, uint8_t msg_type,
         return -1;
     }
 
-    // Wake up the network thread immediately
+    // Wake up the network thread
     zmq_send(net->pipe_send, "", 0, ZMQ_DONTWAIT);
 
     return 0;
@@ -439,6 +444,31 @@ int network_recv_raft(network_t *net, int *from_id, uint8_t *msg_type,
 
     mail_t mail;
     if (mailbox_pop(net->raft_inbox, &mail) != 0) return 0;
+
+    if (from_id) *from_id = mail.peer_id;
+    if (msg_type) *msg_type = mail.msg_type;
+
+    size_t copy_len = mail.len < buf_cap ? mail.len : buf_cap;
+    if (buf && mail.data && copy_len > 0) {
+        memcpy(buf, mail.data, copy_len);
+    }
+
+    free(mail.data);
+    return (int)mail.len;
+}
+
+/**
+ * Receive gossip message from gossip inbox.
+ *
+ * Same interface as network_recv_raft but reads from the gossip mailbox.
+ */
+int network_recv_gossip(network_t *net, int *from_id, uint8_t *msg_type,
+                        void *buf, size_t buf_cap)
+{
+    if (!net) return -1;
+
+    mail_t mail;
+    if (mailbox_pop(net->gossip_inbox, &mail) != 0) return 0;
 
     if (from_id) *from_id = mail.peer_id;
     if (msg_type) *msg_type = mail.msg_type;

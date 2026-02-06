@@ -11,6 +11,7 @@
 #include "raft.h"
 #include "storage/storage_mgr.h"
 #include "network/network.h"
+#include "dag_entry.h"
 
 #ifdef __cplusplus
 extern "C" {
@@ -49,6 +50,10 @@ typedef struct raft_glue_ctx {
     uint8_t       *snapshot_recv_buf;
     size_t         snapshot_recv_len;
     size_t         snapshot_recv_cap;
+
+    // DAG
+    server_t *server;
+
 } raft_glue_ctx_t;
 
 // ============================================================================

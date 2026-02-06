@@ -359,6 +359,9 @@ int main(int argc, char **argv) {
         .glue_ctx          = &g_app.glue_ctx,
         .storage           = g_app.glue_ctx.storage,
         .kv                = storage_mgr_get_kv(g_app.glue_ctx.storage),
+        .net               = g_app.glue_ctx.network,   // DAG SHIT
+        .node_id           = g_app.node_id,             // DAG SHIT
+        .num_peers         = num_peers,                  // DAG SHIT
         .port              = g_app.port,
         .leader_only_reads = g_app.leader_only,
         .version           = LYGUS_VERSION,
@@ -368,6 +371,9 @@ int main(int argc, char **argv) {
         fprintf(stderr, "Failed to create server on port %d\n", g_app.port);
         ret = 1; goto cleanup_network;
     }
+
+    // DAG SHIT
+    g_app.glue_ctx.server = g_app.server;
 
 
     // --- Setup tick timer ---
