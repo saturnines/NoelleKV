@@ -1,0 +1,6 @@
+[submodule "deps/libzmq"]
+	path = deps/libzmq
+	url = https://github.com/zeromq/libzmq.git
+[submodule "deps/lil-raft"]
+	path = deps/lil-raft
+	url = https://github.com/saturnines/lil-raft.git
