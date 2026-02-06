@@ -8,8 +8,8 @@ RUN apt-get update && apt-get install -y \
 
 WORKDIR /build
 
-
-RUN git clone --recursive https://github.com/saturnines/lygus.git .
+COPY . .
+RUN git submodule update --init --recursive
 
 RUN mkdir -p build && cd build && \
     cmake .. -DCMAKE_BUILD_TYPE=Release && \
