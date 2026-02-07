@@ -14,7 +14,7 @@
  *   Raft commits batch → dag_deserialize_batch into temp DAG
  *                       → dag_iter_topo for deterministic order
  *                       → apply each op to KV state machine
- *                       → dag_reset local DAG
+ *                       → selectively prune committed nodes from local DAG
  */
 
 #include "handler.h"
@@ -342,6 +342,10 @@ static void apply_node_to_kv(dag_node_t *node, void *ctx) {
  * Apply a committed DAG batch entry from the Raft log.
  *
  * Called from the Raft glue layer when it sees entry[0] == 0xDA.
+ *
+ * BUG FIX: Selective removal instead of dag_reset.  Only remove
+ * committed nodes from the local DAG.  Nodes that arrived via gossip
+ * or client writes during the commit window survive for the next cycle.
  */
 int handler_apply_dag_batch(handler_t *h, const uint8_t *entry, size_t len) {
     if (!h || !entry || !dag_entry_is_batch(entry, len)) return -1;
@@ -357,22 +361,34 @@ int handler_apply_dag_batch(handler_t *h, const uint8_t *entry, size_t len) {
     int count = dag_deserialize_batch(h->apply_dag, payload, payload_len);
     if (count < 0) return -1;
 
+    // Collect hashes of committed nodes BEFORE applying
+    size_t committed_count = dag_count(h->apply_dag);
+    uint8_t *committed_hashes = NULL;
+
+    if (committed_count > 0) {
+        committed_hashes = malloc(committed_count * DAG_HASH_SIZE);
+        if (committed_hashes) {
+            committed_count = dag_collect_hashes(h->apply_dag,
+                                                  committed_hashes,
+                                                  committed_count);
+        } else {
+            committed_count = 0;
+        }
+    }
+
     // Apply in deterministic topo order to KV state machine
     dag_iter_topo(h->apply_dag, apply_node_to_kv, h);
 
     // Clean up temp DAG
     dag_reset(h->apply_dag);
 
-    // Reset the LOCAL write DAG.  The leader already resets in
-    // propose_dag_batch, but followers never did — causing unbounded
-    // growth.  Nodes that arrived via gossip after the leader serialized
-    // this batch are lost locally but still exist on other replicas;
-    // anti-entropy will re-deliver them before the next commit cycle.
-    dag_reset(h->dag);
+    if (committed_count > 0 && committed_hashes) {
+        dag_remove_by_hashes(h->dag, committed_hashes, committed_count);
+    }
+    free(committed_hashes);
 
     h->stats.dag_batches_applied++;
 
-    // Batch is now fully applied to the KV state machine.
     // Clear the in-flight flag so the next tick/read can propose again.
     h->dag_propose_pending = false;
 
@@ -385,7 +401,6 @@ int handler_apply_dag_batch(handler_t *h, const uint8_t *entry, size_t len) {
 
 static uint64_t propose_dag_batch(handler_t *h) {
     if (h->dag_propose_pending) {
-        printf("[DEBUG] propose_dag_batch: already pending\n");
         return 0;
     }
 
@@ -395,16 +410,12 @@ static uint64_t propose_dag_batch(handler_t *h) {
     h->batch_buf[0] = DAG_ENTRY_MARKER;
     ssize_t batch_len = dag_serialize_batch(h->dag, h->batch_buf + 1,
                                              h->batch_buf_cap - 1);
-    printf("[DEBUG] dag_serialize_batch returned %zd\n", batch_len);
 
     if (batch_len < 0) return 0;
 
     size_t entry_len = 1 + (size_t)batch_len;
-    printf("[DEBUG] proposing entry len=%zu byte0=0x%02X\n",
-           entry_len, h->batch_buf[0]);
 
     int ret = raft_propose(h->raft, h->batch_buf, entry_len);
-    printf("[DEBUG] raft_propose returned %d\n", ret);
 
     if (ret != 0) return 0;
 
@@ -498,13 +509,8 @@ static void handle_get(handler_t *h, conn_t *conn, const request_t *req) {
     }
 
     if (raft_is_leader(h->raft) && dag_count(h->dag) > 0) {
-        printf("[DEBUG] DAG has %zu nodes, proposing batch\n", dag_count(h->dag));
         propose_dag_batch(h);
     }
-
-    uint64_t pending = raft_get_pending_index(h->raft);
-    printf("[DEBUG] pending=%lu commit=%lu applied=%lu\n",
-           pending, raft_get_commit_index(h->raft), raft_get_last_applied(h->raft));
 
     uint64_t now_ms = event_loop_now_ms(h->loop);
     lygus_err_t err = alr_read(h->alr, req->key, req->klen, conn, now_ms);
