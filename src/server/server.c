@@ -499,6 +499,22 @@ int server_try_apply_entry(server_t *srv, const uint8_t *entry, size_t len) {
     return handler_apply_dag_batch(srv->handler, entry, len);
 }
 
+/**
+ * Flush pending DAG writes to Raft (if leader).
+ *
+ * Called from the glue layer when a ReadIndex request arrives from
+ * a follower.  A ReadIndex IS an observation — some node wants to
+ * read, so we must commit pending writes before responding with
+ * commit_index.
+ *
+ * Add to server.h:
+ *   void server_flush_dag(server_t *srv);
+ */
+void server_flush_dag(server_t *srv) {
+    if (!srv) return;
+    handler_flush_dag(srv->handler);
+}
+
 // ============================================================================
 // Stats
 // ============================================================================

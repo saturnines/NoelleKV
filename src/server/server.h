@@ -123,6 +123,16 @@ void server_on_readindex_complete(server_t *srv, uint64_t req_id,
  */
 int server_try_apply_entry(server_t *srv, const uint8_t *entry, size_t len);
 
+/**
+ * Flush pending DAG writes to Raft (leader only).
+ *
+ * Called from the glue layer when a ReadIndex request arrives from
+ * a follower.  A ReadIndex IS an observation in the Hollow Purple
+ * model — some node wants to read, so we must commit pending DAG
+ * writes before responding with commit_index.
+ */
+void server_flush_dag(server_t *srv);
+
 // ============================================================================
 // Stats
 // ============================================================================

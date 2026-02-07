@@ -602,12 +602,18 @@ int storage_mgr_replay_to(storage_mgr_t *mgr, uint64_t target_index)
 
         switch (entry.type) {
             case WAL_ENTRY_PUT:
+                // Detect DAG batch entries (stored under sentinel key __dag__)
                 if (entry.klen == DAG_WAL_KEY_LEN &&
                     memcmp(entry.key, DAG_WAL_KEY, DAG_WAL_KEY_LEN) == 0) {
+                    // DAG batch — must deserialize + topo sort + apply
                     if (mgr->dag_replay_fn) {
                         ret = mgr->dag_replay_fn(
                             entry.val, entry.vlen, mgr->kv, mgr->dag_replay_ctx);
                     } else {
+                        // No callback registered — cannot replay DAG batches.
+                        // This is a bug: the server layer must call
+                        // storage_mgr_set_dag_replay before any operation
+                        // that could trigger WAL replay.
                         LOG_ERROR(LYGUS_MODULE_STORAGE, LYGUS_EVENT_WAL_RECOVERY,
                                   idx, 0, NULL, 0);
                         ret = LYGUS_ERR_INTERNAL;

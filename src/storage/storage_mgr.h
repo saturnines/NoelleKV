@@ -85,6 +85,30 @@ int storage_mgr_open(const storage_mgr_config_t *cfg, storage_mgr_t **out);
 void storage_mgr_close(storage_mgr_t *mgr);
 
 // ============================================================================
+// DAG Batch Replay
+// ============================================================================
+
+/**
+ * Register a callback for replaying DAG batch entries from WAL.
+ *
+ * During WAL replay (e.g. after log truncation below applied_index),
+ * DAG batch entries (stored under the __dag__ sentinel key) must be
+ * deserialized, topologically sorted, and applied to the KV store
+ * rather than stored as raw blobs.
+ *
+ * Must be called before any operation that could trigger WAL replay.
+ *
+ * @param mgr  Storage manager
+ * @param fn   Callback: receives raw entry bytes, entry length,
+ *             the KV store to apply into, and user context.
+ *             Returns 0 on success, -1 on error.
+ * @param ctx  User context passed to callback
+ */
+void storage_mgr_set_dag_replay(storage_mgr_t *mgr,
+    int (*fn)(const uint8_t *entry, size_t len, lygus_kv_t *kv, void *ctx),
+    void *ctx);
+
+// ============================================================================
 // Moment 1: Log Operations (before ACK)
 // ============================================================================
 

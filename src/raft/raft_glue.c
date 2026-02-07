@@ -1051,6 +1051,14 @@ int glue_process_network(raft_glue_ctx_t *ctx, raft_t *raft)
                     memcpy(&fn, p, 4);             p += 4;
                     req.from_node = fn;
 
+                    // A follower wants to read — this is an observation.
+                    // Flush pending DAG nodes to Raft so the commit_index
+                    // we return includes them.  Without this, follower
+                    // reads would never trigger leader DAG commits.
+                    if (ctx->server) {
+                        server_flush_dag(ctx->server);
+                    }
+
                     raft_readindex_resp_t resp = {0};
                     raft_recv_readindex(raft, &req, &resp);
 

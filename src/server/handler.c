@@ -782,6 +782,22 @@ merkle_dag_t *handler_get_dag(const handler_t *h) {
     return h ? h->dag : NULL;
 }
 
+/**
+ * Flush pending DAG nodes to Raft if this node is leader.
+ *
+ * Called when a ReadIndex arrives from a follower — this counts as
+ * an "observation" in the Hollow Purple model.  Without this, follower
+ * reads would never trigger the leader to commit pending DAG nodes,
+ * since ReadIndex is processed entirely in the Raft layer and never
+ * flows through handle_get.
+ */
+void handler_flush_dag(handler_t *h) {
+    if (!h) return;
+    if (raft_is_leader(h->raft) && dag_count(h->dag) > 0) {
+        propose_dag_batch(h);
+    }
+}
+
 // ============================================================================
 // Stats
 // ============================================================================

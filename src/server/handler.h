@@ -160,6 +160,12 @@ int handler_apply_dag_batch(handler_t *h, const uint8_t *entry, size_t len);
  */
 merkle_dag_t *handler_get_dag(const handler_t *h);
 
+/**
+ * Flush pending DAG writes to Raft (leader only).
+ * Called when a ReadIndex arrives — an observation that triggers commitment.
+ */
+void handler_flush_dag(handler_t *h);
+
 // ============================================================================
 // Stats
 // ============================================================================

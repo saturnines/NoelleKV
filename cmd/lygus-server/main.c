@@ -180,6 +180,11 @@ static int apply_entry_wrapper(void *ctx, uint64_t index, uint64_t term,
 	printf("[DEBUG] apply index=%lu len=%zu byte0=0x%02X\n",
            index, len, (data && len > 0) ? ((const uint8_t*)data)[0] : 0);
 
+    // Use glue_apply_entry for ALL entries — it handles DAG batches
+    // (0xDA prefix) internally and correctly advances storage_mgr's
+    // applied_index via apply_noop.  The previous shortcut here skipped
+    // that bookkeeping, causing applied_index to fall behind and crash
+    // on recovery when a subsequent entry's index != applied_index + 1.
     int ret = glue_apply_entry(ctx, index, term, type, data, len);
 
     if (ret == 0 && g_app.server) {
