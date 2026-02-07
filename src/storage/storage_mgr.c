@@ -68,6 +68,14 @@ struct storage_mgr {
     // WAL size tracking
     size_t wal_bytes_written;
 
+    // DAG batch replay callback (set by server/handler layer)
+    // Called during WAL replay when a DAG batch entry (__dag__ key) is
+    // encountered.  Without this, replay would store the raw batch blob
+    // as a KV entry instead of deserializing + topo-sorting + applying.
+    int (*dag_replay_fn)(const uint8_t *entry, size_t len,
+                         lygus_kv_t *kv, void *ctx);
+    void *dag_replay_ctx;
+
     // Async snapshot state (POSIX only)
 #ifndef _WIN32
     int      snapshot_in_progress;
@@ -323,6 +331,31 @@ void storage_mgr_close(storage_mgr_t *mgr)
 }
 
 // ============================================================================
+// DAG Batch Replay Registration
+// ============================================================================
+
+/**
+ * Register a callback for replaying DAG batch entries from WAL.
+ *
+ * Must be called before any truncation that could trigger WAL replay.
+ * The callback receives the raw WAL value (which starts with 0xDA),
+ * a pointer to the KV store to apply into, and the user context.
+ *
+ * Add to storage_mgr.h:
+ *   void storage_mgr_set_dag_replay(storage_mgr_t *mgr,
+ *       int (*fn)(const uint8_t *entry, size_t len, lygus_kv_t *kv, void *ctx),
+ *       void *ctx);
+ */
+void storage_mgr_set_dag_replay(storage_mgr_t *mgr,
+    int (*fn)(const uint8_t *entry, size_t len, lygus_kv_t *kv, void *ctx),
+    void *ctx)
+{
+    if (!mgr) return;
+    mgr->dag_replay_fn = fn;
+    mgr->dag_replay_ctx = ctx;
+}
+
+// ============================================================================
 // Moment 1: Log Operations
 // ============================================================================
 
@@ -569,8 +602,20 @@ int storage_mgr_replay_to(storage_mgr_t *mgr, uint64_t target_index)
 
         switch (entry.type) {
             case WAL_ENTRY_PUT:
-                ret = lygus_kv_put(mgr->kv, entry.key, entry.klen,
-                                   entry.val, entry.vlen);
+                if (entry.klen == DAG_WAL_KEY_LEN &&
+                    memcmp(entry.key, DAG_WAL_KEY, DAG_WAL_KEY_LEN) == 0) {
+                    if (mgr->dag_replay_fn) {
+                        ret = mgr->dag_replay_fn(
+                            entry.val, entry.vlen, mgr->kv, mgr->dag_replay_ctx);
+                    } else {
+                        LOG_ERROR(LYGUS_MODULE_STORAGE, LYGUS_EVENT_WAL_RECOVERY,
+                                  idx, 0, NULL, 0);
+                        ret = LYGUS_ERR_INTERNAL;
+                    }
+                } else {
+                    ret = lygus_kv_put(mgr->kv, entry.key, entry.klen,
+                                       entry.val, entry.vlen);
+                }
                 break;
 
             case WAL_ENTRY_DEL:

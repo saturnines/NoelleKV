@@ -14,6 +14,10 @@
 #include "network/network.h"
 #include "dag_entry.h"
 #include "event/event_loop.h"
+#include "merkle_dag.h"
+#include "dag_serial.h"
+#include "state/kv_store.h"
+#include "storage/storage_mgr.h"
 
 #include "platform/platform.h"
 #include "public/lygus_errors.h"
@@ -131,6 +135,70 @@ static conn_node_t *conn_list_find(server_t *srv, conn_t *conn) {
 }
 
 // ============================================================================
+// DAG Batch Replay for WAL Recovery (Fix #4)
+// ============================================================================
+
+typedef struct {
+    lygus_kv_t *kv;
+} dag_replay_ctx_t;
+
+/**
+ * Apply a single DAG node to the KV store during WAL replay.
+ * Same logic as handler.c:apply_node_to_kv but operates on an
+ * arbitrary KV pointer (which may be a freshly-loaded snapshot).
+ */
+static void replay_apply_node(dag_node_t *node, void *ctx) {
+    dag_replay_ctx_t *rc = (dag_replay_ctx_t *)ctx;
+    if (!node || node->value_len == 0) return;
+
+    uint8_t op = node->value[0];
+    if (op == DAG_OP_PUT && node->value_len > 1) {
+        lygus_kv_put(rc->kv, node->key, node->key_len,
+                     node->value + 1, node->value_len - 1);
+    } else if (op == DAG_OP_DEL) {
+        lygus_kv_del(rc->kv, node->key, node->key_len);
+    }
+}
+
+/**
+ * Callback for storage_mgr WAL replay of DAG batch entries.
+ *
+ * Receives the raw WAL value (which is the full Raft entry including
+ * the 0xDA marker), deserializes into a temp DAG, topo-sorts, and
+ * applies each operation to the provided KV store.
+ */
+static int dag_replay_callback(const uint8_t *entry, size_t len,
+                                lygus_kv_t *kv, void *ctx) {
+    (void)ctx;
+
+    if (!entry || len == 0 || !kv) return -1;
+
+    // The WAL value is the raw Raft entry: [0xDA][batch_payload...]
+    if (!dag_entry_is_batch(entry, len)) return -1;
+
+    const uint8_t *payload = dag_entry_batch_payload(entry);
+    size_t payload_len = dag_entry_batch_len(len);
+    if (payload_len < 4) return -1;
+
+    // Temp DAG for deserialization (small — only for this single batch)
+    merkle_dag_t *tmp = dag_create(65536, 16 * 1024 * 1024);
+    if (!tmp) return -1;
+
+    int count = dag_deserialize_batch(tmp, payload, payload_len);
+    if (count < 0) {
+        dag_destroy(tmp);
+        return -1;
+    }
+
+    // Apply in deterministic topo order
+    dag_replay_ctx_t rc = { .kv = kv };
+    dag_iter_topo(tmp, replay_apply_node, &rc);
+
+    dag_destroy(tmp);
+    return 0;
+}
+
+// ============================================================================
 // Lifecycle
 // ============================================================================
 
@@ -199,6 +267,14 @@ server_t *server_create(const server_config_t *cfg) {
         free(srv->gossip_buf);
         free(srv);
         return NULL;
+    }
+
+    // Register DAG batch replay callback so that WAL replay
+    // (triggered by log truncation below applied_index) correctly
+    // deserializes + topo-sorts DAG batches instead of storing them
+    // as raw blobs under the __dag__ sentinel key.
+    if (srv->storage) {
+        storage_mgr_set_dag_replay(srv->storage, dag_replay_callback, NULL);
     }
 
     // Create listen socket

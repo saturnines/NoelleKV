@@ -179,16 +179,7 @@ static int apply_entry_wrapper(void *ctx, uint64_t index, uint64_t term,
 
 	printf("[DEBUG] apply index=%lu len=%zu byte0=0x%02X\n",
            index, len, (data && len > 0) ? ((const uint8_t*)data)[0] : 0);
-    // Try DAG batch path first (entry starts with 0xDA)
-    if (g_app.server && data && len > 0 && ((const uint8_t *)data)[0] == 0xDA) {
-        if (server_try_apply_entry(g_app.server, (const uint8_t *)data, len) == 0) {
 
-            server_on_commit(g_app.server, index, term);
-            return 0;
-        }
-    }
-
-    // Legacy apply path (regular PUT/DEL entries)
     int ret = glue_apply_entry(ctx, index, term, type, data, len);
 
     if (ret == 0 && g_app.server) {

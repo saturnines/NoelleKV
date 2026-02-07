@@ -363,11 +363,12 @@ int handler_apply_dag_batch(handler_t *h, const uint8_t *entry, size_t len) {
     // Clean up temp DAG
     dag_reset(h->apply_dag);
 
-    // NOTE: We do NOT reset h->dag here. The write DAG may contain
-    // nodes that arrived via gossip after the leader serialized this
-    // batch. Those nodes belong to the next commit cycle.
-    // Content-addressed dedup in dag_add means re-gossiped committed
-    // nodes are harmless no-ops if they reappear.
+    // Reset the LOCAL write DAG.  The leader already resets in
+    // propose_dag_batch, but followers never did — causing unbounded
+    // growth.  Nodes that arrived via gossip after the leader serialized
+    // this batch are lost locally but still exist on other replicas;
+    // anti-entropy will re-deliver them before the next commit cycle.
+    dag_reset(h->dag);
 
     h->stats.dag_batches_applied++;
 
@@ -765,9 +766,6 @@ void handler_tick(handler_t *h, uint64_t now_ms) {
 
     gossip_tick(h->gossip, gossip_send_cb, h);
 
-    if (raft_is_leader(h->raft) && dag_count(h->dag) > 0) {
-        propose_dag_batch(h);
-    }
 }
 
 void handler_on_readindex_complete(handler_t *h, uint64_t req_id,
