@@ -1,10 +1,17 @@
 /**
  * handler.c - Request handling with CRDT Merkle DAG + Raft integration
  *
- * Write path (any node):
+ * Write path (leader):
  *   PUT/DEL → dag_add(key, tagged_value, tips_as_parents)
  *           → immediate OK to client
- *           → push-on-write gossip to all peers
+ *           → fire-and-forget push to all peers
+ *
+ * Write path (follower):
+ *   PUT/DEL → dag_add(key, tagged_value, tips_as_parents)
+ *           → confirmed push to leader (MSG_DAG_PUSH_CONFIRMED)
+ *           → fire-and-forget push to other peers
+ *           → wait for leader ACK (MSG_DAG_PUSH_ACK)
+ *           → OK to client (causal lease: leader has the write)
  *
  * Read path (leader):
  *   GET → if DAG non-empty: serialize batch, raft_propose
@@ -63,6 +70,20 @@
 // Max tips to use as parents for a new node
 #define MAX_TIP_PARENTS          8
 
+// Confirmed push: max outstanding writes awaiting leader ACK
+#define MAX_PENDING_PUSHES       4096
+
+// ============================================================================
+// Confirmed Push - pending write awaiting leader acknowledgement
+// ============================================================================
+
+typedef struct {
+    uint64_t    seq;            // Sequence number sent to leader
+    conn_t     *conn;           // Client connection to ACK when confirmed
+    uint64_t    deadline_ms;    // Timeout deadline
+    bool        active;         // Slot in use
+} pending_push_t;
+
 // ============================================================================
 // Internal Structure
 // ============================================================================
@@ -104,6 +125,10 @@ struct handler {
     // DAG commit state
     bool             dag_propose_pending;  // true while a batch is in Raft pipeline
 
+    // Confirmed push state
+    pending_push_t   pushes[MAX_PENDING_PUSHES];
+    uint64_t         next_push_seq;
+
     // Stats
     handler_stats_t  stats;
 };
@@ -128,6 +153,37 @@ static uint64_t propose_dag_batch(handler_t *h);
 
 // Push a single node to all peers
 static void push_node_to_peers(handler_t *h, dag_node_t *node);
+
+// Send confirmed push to leader, stash connection for ACK
+static void push_node_confirmed(handler_t *h, conn_t *conn, dag_node_t *node);
+
+// ============================================================================
+// Confirmed Push Helpers
+// ============================================================================
+
+static pending_push_t *push_alloc(handler_t *h) {
+    for (int i = 0; i < MAX_PENDING_PUSHES; i++) {
+        if (!h->pushes[i].active) {
+            return &h->pushes[i];
+        }
+    }
+    return NULL;  // Table full
+}
+
+static pending_push_t *push_find(handler_t *h, uint64_t seq) {
+    for (int i = 0; i < MAX_PENDING_PUSHES; i++) {
+        if (h->pushes[i].active && h->pushes[i].seq == seq) {
+            return &h->pushes[i];
+        }
+    }
+    return NULL;
+}
+
+static void push_remove(pending_push_t *pp) {
+    pp->active = false;
+    pp->conn = NULL;
+    pp->seq = 0;
+}
 
 // ============================================================================
 // Lifecycle
@@ -227,6 +283,13 @@ void handler_destroy(handler_t *h) {
     if (h->pending) {
         pending_fail_all(h->pending, LYGUS_ERR_INTERNAL);
         pending_destroy(h->pending);
+    }
+
+    // Fail any outstanding confirmed pushes
+    for (int i = 0; i < MAX_PENDING_PUSHES; i++) {
+        if (h->pushes[i].active) {
+            push_remove(&h->pushes[i]);
+        }
     }
 
     if (h->alr) alr_destroy(h->alr);
@@ -462,6 +525,72 @@ static void push_node_to_peers(handler_t *h, dag_node_t *node) {
     h->stats.dag_nodes_gossiped++;
 }
 
+
+static void push_node_confirmed(handler_t *h, conn_t *conn, dag_node_t *node) {
+    if (!h->net || !node) goto fail;
+
+    int leader = raft_get_leader_id(h->raft);
+    if (leader < 0) goto fail;
+
+    // Allocate a slot in the pending push table
+    pending_push_t *pp = push_alloc(h);
+    if (!pp) goto fail;
+
+    ssize_t needed = dag_node_serialized_size(node);
+    if (needed <= 0) goto fail;
+
+    // Build confirmed push payload: [seq:8][serialized_node]
+    size_t total = 8 + (size_t)needed;
+
+    // Grow push buffer if needed
+    if (total > h->node_push_cap) {
+        size_t new_cap = total * 2;
+        uint8_t *new_buf = realloc(h->node_push_buf, new_cap);
+        if (!new_buf) goto fail;
+        h->node_push_buf = new_buf;
+        h->node_push_cap = new_cap;
+    }
+
+    uint64_t seq = h->next_push_seq++;
+
+    // Write sequence number (little-endian)
+    memcpy(h->node_push_buf, &seq, 8);
+
+    // Write serialized node after seq
+    ssize_t wrote = dag_node_serialize(node, h->node_push_buf + 8, h->node_push_cap - 8);
+    if (wrote <= 0) goto fail;
+
+    // Send confirmed push to leader
+    network_send_raft(h->net, leader, MSG_DAG_PUSH_CONFIRMED,
+                      h->node_push_buf, 8 + (size_t)wrote);
+
+    // Fire-and-forget push to other peers (not leader, not self)
+    for (int i = 0; i < h->num_peers; i++) {
+        if (i == h->node_id || i == leader) continue;
+        network_send_raft(h->net, i, MSG_DAG_PUSH,
+                          h->node_push_buf + 8, (size_t)wrote);
+    }
+
+    // Stash connection — client gets ACKed when leader responds
+    uint64_t now_ms = event_loop_now_ms(h->loop);
+    pp->seq = seq;
+    pp->conn = conn;
+    pp->deadline_ms = now_ms + h->timeout_ms;
+    pp->active = true;
+
+    h->stats.dag_nodes_gossiped++;
+    return;
+
+fail:
+    // Can't confirm — fail the client
+    {
+        int n = protocol_fmt_error(h->resp_buf, RESPONSE_BUF_SIZE,
+                                   "confirmed push failed");
+        if (n > 0) conn_send(conn, h->resp_buf, (size_t)n);
+        h->stats.requests_error++;
+    }
+}
+
 // ============================================================================
 // Request Handling
 // ============================================================================
@@ -539,12 +668,6 @@ static void handle_get(handler_t *h, conn_t *conn, const request_t *req) {
     h->stats.requests_error++;
 }
 
-/**
- * PUT handler - write to local DAG, immediate ack, gossip push
- *
- * No leadership check. Any node accepts writes.
- * Durability comes from the next read-triggered batch commit.
- */
 static void handle_put(handler_t *h, conn_t *conn, const request_t *req) {
     h->stats.writes_total++;
 
@@ -585,14 +708,20 @@ static void handle_put(handler_t *h, conn_t *conn, const request_t *req) {
         return;
     }
 
-    // Immediate ack — write is in the DAG
-    int n = protocol_fmt_ok(h->resp_buf, RESPONSE_BUF_SIZE);
-    if (n > 0) conn_send(conn, h->resp_buf, (size_t)n);
-    h->stats.requests_ok++;
-    h->stats.dag_inserts++;
+    if (raft_is_leader(h->raft)) {
+        // Leader: immediate ack — we already have the write
+        int n = protocol_fmt_ok(h->resp_buf, RESPONSE_BUF_SIZE);
+        if (n > 0) conn_send(conn, h->resp_buf, (size_t)n);
+        h->stats.requests_ok++;
+        h->stats.dag_inserts++;
 
-    // Push-on-write: broadcast to all peers
-    push_node_to_peers(h, node);
+        // Fire-and-forget push to all peers
+        push_node_to_peers(h, node);
+    } else {
+        // Follower: confirmed push — hold connection until leader ACKs
+        h->stats.dag_inserts++;
+        push_node_confirmed(h, conn, node);
+    }
 }
 
 /**
@@ -627,14 +756,19 @@ static void handle_del(handler_t *h, conn_t *conn, const request_t *req) {
         return;
     }
 
-    // Immediate ack
-    int n = protocol_fmt_ok(h->resp_buf, RESPONSE_BUF_SIZE);
-    if (n > 0) conn_send(conn, h->resp_buf, (size_t)n);
-    h->stats.requests_ok++;
-    h->stats.dag_inserts++;
+    if (raft_is_leader(h->raft)) {
+        // Leader: immediate ack
+        int n = protocol_fmt_ok(h->resp_buf, RESPONSE_BUF_SIZE);
+        if (n > 0) conn_send(conn, h->resp_buf, (size_t)n);
+        h->stats.requests_ok++;
+        h->stats.dag_inserts++;
 
-    // Push-on-write
-    push_node_to_peers(h, node);
+        push_node_to_peers(h, node);
+    } else {
+        // Follower: confirmed push
+        h->stats.dag_inserts++;
+        push_node_confirmed(h, conn, node);
+    }
 }
 
 void handler_process(handler_t *h, conn_t *conn, const char *line, size_t len) {
@@ -712,6 +846,44 @@ void handler_on_gossip(handler_t *h, int from_peer, uint8_t msg_type,
         return;
     }
 
+    if (msg_type == MSG_DAG_PUSH_CONFIRMED) {
+        // Leader receives confirmed push from follower: [seq:8][serialized_node]
+        if (!data || len <= 8) return;
+
+        uint64_t seq;
+        memcpy(&seq, data, 8);
+
+        // Deserialize node into our DAG
+        size_t consumed = 0;
+        dag_node_deserialize(h->dag, data + 8, len - 8, &consumed);
+
+        // Send ACK back to the follower
+        network_send_raft(h->net, from_peer, MSG_DAG_PUSH_ACK,
+                          (const uint8_t *)&seq, 8);
+        return;
+    }
+
+    if (msg_type == MSG_DAG_PUSH_ACK) {
+        // Follower receives ACK from leader: [seq:8]
+        if (!data || len < 8) return;
+
+        uint64_t seq;
+        memcpy(&seq, data, 8);
+
+        pending_push_t *pp = push_find(h, seq);
+        if (pp && pp->conn) {
+            // NOW we can ACK the client
+            int n = protocol_fmt_ok(h->resp_buf, RESPONSE_BUF_SIZE);
+            if (n > 0) conn_send(pp->conn, h->resp_buf, (size_t)n);
+            h->stats.requests_ok++;
+            push_remove(pp);
+        } else if (pp) {
+            // Connection gone (client disconnected), just clean up
+            push_remove(pp);
+        }
+        return;
+    }
+
     // Anti-entropy protocol messages (30-34)
     gossip_recv(h->gossip, from_peer, msg_type, data, len,
                 gossip_send_cb, h);
@@ -743,6 +915,19 @@ void handler_on_leadership_change(handler_t *h, bool is_leader) {
         // Clear in-flight flag — the new leader may re-commit our
 
         h->dag_propose_pending = false;
+
+        // Fail all pending pushes — leader changed, ACKs won't come
+        for (int i = 0; i < MAX_PENDING_PUSHES; i++) {
+            pending_push_t *pp = &h->pushes[i];
+            if (!pp->active) continue;
+            if (pp->conn) {
+                int n = protocol_fmt_error(h->resp_buf, RESPONSE_BUF_SIZE,
+                                           "leader changed");
+                if (n > 0) conn_send(pp->conn, h->resp_buf, (size_t)n);
+                h->stats.requests_error++;
+            }
+            push_remove(pp);
+        }
     }
 }
 
@@ -761,6 +946,13 @@ void handler_on_conn_close(handler_t *h, conn_t *conn) {
     if (!h || !conn) return;
     pending_fail_conn(h->pending, conn, LYGUS_ERR_NET);
     alr_cancel_conn(h->alr, conn);
+
+    // Null out connection in any pending pushes (don't remove — ACK may still come)
+    for (int i = 0; i < MAX_PENDING_PUSHES; i++) {
+        if (h->pushes[i].active && h->pushes[i].conn == conn) {
+            h->pushes[i].conn = NULL;
+        }
+    }
 }
 
 void handler_tick(handler_t *h, uint64_t now_ms) {
@@ -769,6 +961,21 @@ void handler_tick(handler_t *h, uint64_t now_ms) {
     pending_timeout_sweep(h->pending, now_ms);
     alr_timeout_sweep(h->alr, now_ms);
 
+    // Sweep pending pushes for timeouts
+    for (int i = 0; i < MAX_PENDING_PUSHES; i++) {
+        pending_push_t *pp = &h->pushes[i];
+        if (!pp->active) continue;
+        if (now_ms < pp->deadline_ms) continue;
+
+        // Timed out — fail the client
+        if (pp->conn) {
+            int n = protocol_fmt_error(h->resp_buf, RESPONSE_BUF_SIZE,
+                                       "write timeout (leader ack)");
+            if (n > 0) conn_send(pp->conn, h->resp_buf, (size_t)n);
+            h->stats.requests_error++;
+        }
+        push_remove(pp);
+    }
 
     gossip_tick(h->gossip, gossip_send_cb, h);
 
