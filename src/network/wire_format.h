@@ -51,12 +51,13 @@ static inline int msg_is_gossip(uint8_t type) {
 // Wire Header
 // ============================================================================
 
-#define WIRE_HEADER_SIZE 4
+#define WIRE_HEADER_SIZE 8
 
 typedef struct __attribute__((packed)) {
     uint8_t  type;      // msg_type_t
     uint8_t  from_id;   // Sender node ID
-    uint16_t len;       // Payload length (max 64KB)
+    uint8_t  _reserved[2]; // Alignment / future use
+    uint32_t len;       // Payload length (up to 4GB, practically ~8MB)
 } wire_header_t;
 
 // ============================================================================
@@ -74,13 +75,15 @@ typedef struct __attribute__((packed)) {
  * @return Total bytes written
  */
 static inline size_t wire_encode(void *buf, uint8_t type, uint8_t from_id,
-                                  const void *payload, uint16_t payload_len)
+                                  const void *payload, uint32_t payload_len)
 {
     uint8_t *p = (uint8_t *)buf;
 
     p[0] = type;
     p[1] = from_id;
-    memcpy(p + 2, &payload_len, 2);
+    p[2] = 0;  // reserved
+    p[3] = 0;  // reserved
+    memcpy(p + 4, &payload_len, 4);
 
     if (payload && payload_len > 0) {
         memcpy(p + WIRE_HEADER_SIZE, payload, payload_len);
@@ -108,7 +111,9 @@ static inline const void *wire_decode(const void *buf, size_t len,
 
     hdr->type = p[0];
     hdr->from_id = p[1];
-    memcpy(&hdr->len, p + 2, 2);
+    hdr->_reserved[0] = 0;
+    hdr->_reserved[1] = 0;
+    memcpy(&hdr->len, p + 4, 4);
 
     // Validate
     if (len < WIRE_HEADER_SIZE + hdr->len) {

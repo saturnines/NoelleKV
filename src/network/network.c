@@ -115,7 +115,11 @@ int network_load_peers(const char *path, peer_info_t *peers, int max_peers)
 static void *network_thread_func(void *arg)
 {
     network_t *net = (network_t *)arg;
-    uint8_t buf[65536];
+
+    // Dynamic send buffer — grows as needed, reused across iterations
+    size_t send_buf_cap = 65536;
+    uint8_t *send_buf = malloc(send_buf_cap);
+    if (!send_buf) return NULL;
 
     while (net->running) {
         // 1. Drain outbox (Raft + gossip messages share the same outbox)
@@ -132,11 +136,25 @@ static void *network_thread_func(void *arg)
             }
 
             if (dealer) {
-                size_t wire_len = wire_encode(buf, mail.msg_type, net->node_id,
-                                              mail.data, mail.len);
+                size_t needed = WIRE_HEADER_SIZE + mail.len;
+                if (needed > send_buf_cap) {
+                    size_t new_cap = needed * 2;
+                    uint8_t *new_buf = realloc(send_buf, new_cap);
+                    if (new_buf) {
+                        send_buf = new_buf;
+                        send_buf_cap = new_cap;
+                    }
+                    // If realloc fails, skip this message (best-effort)
+                }
 
-                if (zmq_send(dealer, buf, wire_len, ZMQ_DONTWAIT) == -1) {
-                    // Fail silently (Raft retries, gossip is best-effort)
+                if (WIRE_HEADER_SIZE + mail.len <= send_buf_cap) {
+                    size_t wire_len = wire_encode(send_buf, mail.msg_type,
+                                                  net->node_id,
+                                                  mail.data, mail.len);
+
+                    if (zmq_send(dealer, send_buf, wire_len, ZMQ_DONTWAIT) == -1) {
+                        // Fail silently (Raft retries, gossip is best-effort)
+                    }
                 }
             }
 
@@ -164,14 +182,23 @@ static void *network_thread_func(void *arg)
             zmq_recv(net->pipe_recv, dummy, 1, ZMQ_DONTWAIT);
         }
 
-        // 3. Receive messages (ROUTER) - route to raft or gossip inbox
+        // 3. Receive messages (ROUTER) - drain ALL pending messages
         if (items[0].revents & ZMQ_POLLIN) {
-            zmq_msg_t identity, data;
-            zmq_msg_init(&identity);
-            zmq_msg_init(&data);
+            while (1) {
+                zmq_msg_t identity, data;
+                zmq_msg_init(&identity);
+                zmq_msg_init(&data);
 
-            if (zmq_msg_recv(&identity, net->raft_router, 0) >= 0 &&
-                zmq_msg_recv(&data, net->raft_router, 0) >= 0) {
+                if (zmq_msg_recv(&identity, net->raft_router, ZMQ_DONTWAIT) < 0) {
+                    zmq_msg_close(&identity);
+                    zmq_msg_close(&data);
+                    break;
+                }
+                if (zmq_msg_recv(&data, net->raft_router, ZMQ_DONTWAIT) < 0) {
+                    zmq_msg_close(&identity);
+                    zmq_msg_close(&data);
+                    break;
+                }
 
                 size_t len = zmq_msg_size(&data);
                 if (len >= WIRE_HEADER_SIZE) {
@@ -192,12 +219,11 @@ static void *network_thread_func(void *arg)
                             .data = payload_copy,
                         };
 
-                        // Route based on message type
                         mailbox_t *target;
                         if (msg_is_gossip(hdr.type)) {
-                            target = net->gossip_inbox;    // <-- gossip
+                            target = net->gossip_inbox;
                         } else {
-                            target = net->raft_inbox;      // <-- raft
+                            target = net->raft_inbox;
                         }
 
                         if (mailbox_push(target, &incoming) == 0) {
@@ -209,15 +235,19 @@ static void *network_thread_func(void *arg)
                         }
                     }
                 }
+
+                zmq_msg_close(&identity);
+                zmq_msg_close(&data);
             }
-            zmq_msg_close(&identity);
-            zmq_msg_close(&data);
         }
 
-        // 4. Receive INV broadcasts (SUB) - unchanged
+        // 4. Receive INV broadcasts (SUB) - drain all pending
         if (items[1].revents & ZMQ_POLLIN) {
-            int len = zmq_recv(net->inv_sub, buf, sizeof(buf), ZMQ_DONTWAIT);
-            if (len >= WIRE_HEADER_SIZE) {
+            while (1) {
+                int len = zmq_recv(net->inv_sub, buf, sizeof(buf), ZMQ_DONTWAIT);
+                if (len < 0) break;
+                if (len < WIRE_HEADER_SIZE) continue;
+
                 wire_header_t hdr;
                 const void *payload = wire_decode(buf, len, &hdr);
 
@@ -242,6 +272,7 @@ static void *network_thread_func(void *arg)
             }
         }
     }
+    free(send_buf);
     return NULL;
 }
 
@@ -486,8 +517,10 @@ int network_broadcast_inv(network_t *net, const void *key, size_t klen)
 {
     if (!net || !net->inv_pub) return -1;
 
-    uint8_t buf[1024];
-    size_t wire_len = wire_encode(buf, MSG_INV, net->node_id, key, (uint16_t)klen);
+    // INV keys are small (max ~1KB) so stack buffer is fine
+    uint8_t buf[1024 + WIRE_HEADER_SIZE];
+    if (klen > 1024) return -1;
+    size_t wire_len = wire_encode(buf, MSG_INV, net->node_id, key, (uint32_t)klen);
     zmq_send(net->inv_pub, buf, wire_len, ZMQ_DONTWAIT);
     return 0;
 }

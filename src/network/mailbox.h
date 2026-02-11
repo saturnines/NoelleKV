@@ -1,7 +1,5 @@
 /**
-* mailbox.h - Thread-safe message queue for network layer
- * Simple bounded MPSC queue.
- * If queue is full, messages are dropped (Raft will retry).
+* mailbox.h - message queue for network layer
  */
 
 #ifndef LYGUS_MAILBOX_H
@@ -68,6 +66,21 @@ extern "C" {
      * Get number of messages in mailbox
      */
     size_t mailbox_count(mailbox_t *mb);
+
+    /**
+     * Set hard upper limit on capacity.
+     *
+     * 0 = no limit (grow unbounded, limited only by malloc).
+     * If the mailbox is already larger than max, it won't shrink,
+     * but it won't grow past max either.
+     */
+    void mailbox_set_max_capacity(mailbox_t *mb, size_t max_cap);
+
+    /**
+     * Get number of dropped messages (pushes that failed due to
+     * max_capacity or OOM).
+     */
+    uint64_t mailbox_drops(mailbox_t *mb);
 
 #ifdef __cplusplus
 }

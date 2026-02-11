@@ -404,19 +404,17 @@ static void on_conn_close(conn_t *conn, void *ctx) {
 }
 
 // ============================================================================
-// Gossip Drain (called from tick)
+// Gossip Drain
 // ============================================================================
 
 /**
- * Drain gossip inbox and dispatch to handler.
- *
- * Processes up to MAX_GOSSIP_PER_TICK messages to avoid
- * starving the event loop under high gossip load.
+ * Drain gossip inbox, up to `limit` messages.
+ * Pass 0 for unlimited (drain everything).
  */
-static void drain_gossip(server_t *srv) {
+static void drain_gossip_n(server_t *srv, int limit) {
     if (!srv->net) return;
 
-    for (int i = 0; i < MAX_GOSSIP_PER_TICK; i++) {
+    for (int i = 0; limit == 0 || i < limit; i++) {
         int from_id = -1;
         uint8_t msg_type = 0;
 
@@ -437,8 +435,8 @@ static void drain_gossip(server_t *srv) {
 void server_tick(server_t *srv, uint64_t now_ms) {
     if (!srv) return;
 
-    // Drain gossip inbox
-    drain_gossip(srv);
+    // Drain gossip inbox (bounded, don't starve event loop)
+    drain_gossip_n(srv, MAX_GOSSIP_PER_TICK);
 
     // Handler tick (timeouts, gossip anti-entropy)
     handler_tick(srv->handler, now_ms);
@@ -512,7 +510,10 @@ int server_try_apply_entry(server_t *srv, const uint8_t *entry, size_t len) {
  */
 void server_flush_dag(server_t *srv) {
     if (!srv) return;
-    drain_gossip(srv);              // Drain  before flush however, this will be tested just adding this as a note.
+    // UNBOUNDED drain: every push that has reached the mailbox MUST be
+    // in the DAG before we propose.  This is the drain-before-flush
+    // invariant — the foundation of the linearizability argument.
+    drain_gossip_n(srv, 0);
     handler_flush_dag(srv->handler);
 }
 
