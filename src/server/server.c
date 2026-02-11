@@ -512,6 +512,7 @@ int server_try_apply_entry(server_t *srv, const uint8_t *entry, size_t len) {
  */
 void server_flush_dag(server_t *srv) {
     if (!srv) return;
+    drain_gossip(srv);              // Drain  before flush however, this will be tested just adding this as a note.
     handler_flush_dag(srv->handler);
 }
 
