@@ -182,7 +182,6 @@ static void *network_thread_func(void *arg)
             zmq_recv(net->pipe_recv, dummy, 1, ZMQ_DONTWAIT);
         }
 
-        // 3. Receive messages (ROUTER) - drain ALL pending messages
         if (items[0].revents & ZMQ_POLLIN) {
             while (1) {
                 zmq_msg_t identity, data;
@@ -243,13 +242,14 @@ static void *network_thread_func(void *arg)
 
         // 4. Receive INV broadcasts (SUB) - drain all pending
         if (items[1].revents & ZMQ_POLLIN) {
+            uint8_t inv_buf[1024 + WIRE_HEADER_SIZE];
             while (1) {
-                int len = zmq_recv(net->inv_sub, buf, sizeof(buf), ZMQ_DONTWAIT);
+                int len = zmq_recv(net->inv_sub, inv_buf, sizeof(inv_buf), ZMQ_DONTWAIT);
                 if (len < 0) break;
                 if (len < WIRE_HEADER_SIZE) continue;
 
                 wire_header_t hdr;
-                const void *payload = wire_decode(buf, len, &hdr);
+                const void *payload = wire_decode(inv_buf, len, &hdr);
 
                 if (payload && hdr.type == MSG_INV) {
                     uint8_t *key_copy = NULL;
@@ -519,7 +519,7 @@ int network_broadcast_inv(network_t *net, const void *key, size_t klen)
 
     // INV keys are small (max ~1KB) so stack buffer is fine
     uint8_t buf[1024 + WIRE_HEADER_SIZE];
-    if (klen > 1024) return -1;
+    if (klen > 1024) return -1;  // INV keys shouldn't be this large
     size_t wire_len = wire_encode(buf, MSG_INV, net->node_id, key, (uint32_t)klen);
     zmq_send(net->inv_pub, buf, wire_len, ZMQ_DONTWAIT);
     return 0;
