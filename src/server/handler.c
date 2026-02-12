@@ -497,19 +497,107 @@ static uint64_t propose_dag_batch(handler_t *h) {
     size_t count = dag_count(h->dag);
     if (count == 0) return 0;
 
-    h->batch_buf[0] = DAG_ENTRY_MARKER;
-    ssize_t batch_len = dag_serialize_batch(h->dag, h->batch_buf + 1,
-                                             h->batch_buf_cap - 1);
+    // Item 3: collect hashes of unconfirmed leader writes
 
-    if (batch_len < 0) return 0;
+    uint8_t *exclude_hashes = NULL;
+    size_t excl_count = 0;
+
+    // Count pending leader writes first
+    for (int i = 0; i < MAX_PENDING_PUSHES; i++) {
+        if (h->pushes[i].active && h->pushes[i].is_leader_write) {
+            excl_count++;
+        }
+    }
+
+    if (excl_count > 0) {
+        exclude_hashes = malloc(excl_count * DAG_HASH_SIZE);
+        if (exclude_hashes) {
+            size_t idx = 0;
+            for (int i = 0; i < MAX_PENDING_PUSHES; i++) {
+                if (h->pushes[i].active && h->pushes[i].is_leader_write) {
+                    memcpy(exclude_hashes + (idx * DAG_HASH_SIZE),
+                           h->pushes[i].hash, DAG_HASH_SIZE);
+                    idx++;
+                }
+            }
+        } else {
+            excl_count = 0;  // OOM fallback: propose nothing
+            free(exclude_hashes);
+            return 0;
+        }
+    }
+
+    // Serialize only confirmed nodes
+    h->batch_buf[0] = DAG_ENTRY_MARKER;
+    ssize_t batch_len = dag_serialize_batch_excluding(
+        h->dag, h->batch_buf + 1, h->batch_buf_cap - 1,
+        exclude_hashes, excl_count);
+
+    if (batch_len < 0) {
+        free(exclude_hashes);
+        return 0;
+    }
+
+    // Check if batch is empty (all nodes were excluded)
+    uint32_t batch_count;
+    memcpy(&batch_count, h->batch_buf + 1, 4);
+    if (batch_count == 0) {
+        free(exclude_hashes);
+        return 0;
+    }
 
     size_t entry_len = 1 + (size_t)batch_len;
 
     int ret = raft_propose(h->raft, h->batch_buf, entry_len);
 
-    if (ret != 0) return 0;
+    if (ret != 0) {
+        free(exclude_hashes);
+        return 0;
+    }
 
-    dag_reset(h->dag);
+    // ---- Selective removal instead of dag_reset ----
+    // Remove only the nodes we just proposed. Unconfirmed writes survive
+    // in the DAG for the next batch after their ff-push confirms.
+    if (excl_count == 0) {
+        // No exclusions — all nodes were proposed, safe to full reset
+        dag_reset(h->dag);
+    } else {
+        // Collect hashes of nodes we DID propose (everything minus excluded)
+        size_t total = dag_count(h->dag);
+        size_t proposed_max = total;  // upper bound
+        uint8_t *proposed_hashes = malloc(proposed_max * DAG_HASH_SIZE);
+        if (proposed_hashes) {
+            size_t proposed_count = dag_collect_hashes(h->dag, proposed_hashes, proposed_max);
+
+            // Filter out the excluded ones
+            size_t write_idx = 0;
+            for (size_t i = 0; i < proposed_count; i++) {
+                const uint8_t *h_ptr = proposed_hashes + (i * DAG_HASH_SIZE);
+                int excluded = 0;
+                for (size_t j = 0; j < excl_count; j++) {
+                    if (memcmp(h_ptr, exclude_hashes + (j * DAG_HASH_SIZE),
+                               DAG_HASH_SIZE) == 0) {
+                        excluded = 1;
+                        break;
+                    }
+                }
+                if (!excluded) {
+                    if (write_idx != i) {
+                        memcpy(proposed_hashes + (write_idx * DAG_HASH_SIZE),
+                               h_ptr, DAG_HASH_SIZE);
+                    }
+                    write_idx++;
+                }
+            }
+
+            if (write_idx > 0) {
+                dag_remove_by_hashes(h->dag, proposed_hashes, write_idx);
+            }
+            free(proposed_hashes);
+        }
+    }
+
+    free(exclude_hashes);
     h->dag_propose_pending = true;
     h->stats.dag_batches_proposed++;
 
@@ -552,8 +640,13 @@ static void push_node_to_peers(handler_t *h, dag_node_t *node) {
     h->stats.dag_nodes_gossiped++;
 }
 
-
-// Item 1: "Leader writes need confirmed push before ACK."
+/**
+ * Leader write: push node to all peers and stash connection.
+ *
+ * Client gets ACKed only when a peer sends MSG_DAG_PUSH_FF_ACK back,
+ * confirming the write exists on at least two nodes (leader + peer).
+ * This is Item 1: "Leader writes need confirmed push before ACK."
+ */
 static void push_node_to_peers_confirmed(handler_t *h, conn_t *conn, dag_node_t *node) {
     if (!h->net || !node) goto fail;
     if (h->num_peers <= 1) {
