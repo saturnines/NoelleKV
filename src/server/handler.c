@@ -3,8 +3,9 @@
  *
  * Write path (leader):
  *   PUT/DEL → dag_add(key, tagged_value, tips_as_parents)
- *           → immediate OK to client
  *           → fire-and-forget push to all peers
+ *           → wait for one peer MSG_DAG_PUSH_FF_ACK
+ *           → OK to client (write on 2 nodes: leader + confirming peer)
  *
  * Write path (follower):
  *   PUT/DEL → dag_add(key, tagged_value, tips_as_parents)
@@ -73,15 +74,28 @@
 // Confirmed push: max outstanding writes awaiting leader ACK
 #define MAX_PENDING_PUSHES       4096
 
+// Fire-and-forget push ACK: peer confirms receipt of a pushed node.
+// Payload: [hash:32].  Leader uses this to ACK client writes.
+// NOTE: Move this to wire_format.h alongside MSG_DAG_PUSH etc.
+#ifndef MSG_DAG_PUSH_FF_ACK
+#define MSG_DAG_PUSH_FF_ACK  36
+#endif
+
 // ============================================================================
-// Confirmed Push - pending write awaiting leader acknowledgement
+// Confirmed Push - pending write awaiting acknowledgement
+//
+// Used for BOTH paths:
+//   - Follower writes: keyed by seq, awaiting leader MSG_DAG_PUSH_ACK
+//   - Leader writes:   keyed by hash, awaiting peer MSG_DAG_PUSH_FF_ACK
 // ============================================================================
 
 typedef struct {
-    uint64_t    seq;            // Sequence number sent to leader
+    uint64_t    seq;            // Sequence number (follower path only)
+    uint8_t     hash[DAG_HASH_SIZE]; // Node hash (leader path only)
     conn_t     *conn;           // Client connection to ACK when confirmed
     uint64_t    deadline_ms;    // Timeout deadline
     bool        active;         // Slot in use
+    bool        is_leader_write; // true = leader awaiting ff-ack, false = follower awaiting push-ack
 } pending_push_t;
 
 // ============================================================================
@@ -172,7 +186,18 @@ static pending_push_t *push_alloc(handler_t *h) {
 
 static pending_push_t *push_find(handler_t *h, uint64_t seq) {
     for (int i = 0; i < MAX_PENDING_PUSHES; i++) {
-        if (h->pushes[i].active && h->pushes[i].seq == seq) {
+        if (h->pushes[i].active && !h->pushes[i].is_leader_write
+            && h->pushes[i].seq == seq) {
+            return &h->pushes[i];
+        }
+    }
+    return NULL;
+}
+
+static pending_push_t *push_find_by_hash(handler_t *h, const uint8_t *hash) {
+    for (int i = 0; i < MAX_PENDING_PUSHES; i++) {
+        if (h->pushes[i].active && h->pushes[i].is_leader_write
+            && memcmp(h->pushes[i].hash, hash, DAG_HASH_SIZE) == 0) {
             return &h->pushes[i];
         }
     }
@@ -183,6 +208,8 @@ static void push_remove(pending_push_t *pp) {
     pp->active = false;
     pp->conn = NULL;
     pp->seq = 0;
+    pp->is_leader_write = false;
+    memset(pp->hash, 0, DAG_HASH_SIZE);
 }
 
 // ============================================================================
@@ -526,6 +553,44 @@ static void push_node_to_peers(handler_t *h, dag_node_t *node) {
 }
 
 
+// Item 1: "Leader writes need confirmed push before ACK."
+static void push_node_to_peers_confirmed(handler_t *h, conn_t *conn, dag_node_t *node) {
+    if (!h->net || !node) goto fail;
+    if (h->num_peers <= 1) {
+        // Single-node cluster: no peers to confirm. ACK immediately.
+        // (Durability is msync-only in this case, which is Item 2.)
+        int n = protocol_fmt_ok(h->resp_buf, RESPONSE_BUF_SIZE);
+        if (n > 0) conn_send(conn, h->resp_buf, (size_t)n);
+        h->stats.requests_ok++;
+        return;
+    }
+
+    pending_push_t *pp = push_alloc(h);
+    if (!pp) goto fail;
+
+    // Push to all peers (reuse existing fire-and-forget path)
+    push_node_to_peers(h, node);
+
+    // Stash connection — client gets ACKed when any peer confirms
+    uint64_t now_ms = event_loop_now_ms(h->loop);
+    memcpy(pp->hash, node->hash, DAG_HASH_SIZE);
+    pp->seq = 0;
+    pp->conn = conn;
+    pp->deadline_ms = now_ms + h->timeout_ms;
+    pp->active = true;
+    pp->is_leader_write = true;
+    return;
+
+fail:
+    {
+        int n = protocol_fmt_error(h->resp_buf, RESPONSE_BUF_SIZE,
+                                   "confirmed push failed");
+        if (n > 0) conn_send(conn, h->resp_buf, (size_t)n);
+        h->stats.requests_error++;
+    }
+}
+
+
 static void push_node_confirmed(handler_t *h, conn_t *conn, dag_node_t *node) {
     if (!h->net || !node) goto fail;
 
@@ -709,14 +774,9 @@ static void handle_put(handler_t *h, conn_t *conn, const request_t *req) {
     }
 
     if (raft_is_leader(h->raft)) {
-        // Leader: immediate ack — we already have the write
-        int n = protocol_fmt_ok(h->resp_buf, RESPONSE_BUF_SIZE);
-        if (n > 0) conn_send(conn, h->resp_buf, (size_t)n);
-        h->stats.requests_ok++;
+        // Leader: hold connection, push to peers, ACK on first confirmation
         h->stats.dag_inserts++;
-
-        // Fire-and-forget push to all peers
-        push_node_to_peers(h, node);
+        push_node_to_peers_confirmed(h, conn, node);
     } else {
         // Follower: confirmed push — hold connection until leader ACKs
         h->stats.dag_inserts++;
@@ -757,13 +817,9 @@ static void handle_del(handler_t *h, conn_t *conn, const request_t *req) {
     }
 
     if (raft_is_leader(h->raft)) {
-        // Leader: immediate ack
-        int n = protocol_fmt_ok(h->resp_buf, RESPONSE_BUF_SIZE);
-        if (n > 0) conn_send(conn, h->resp_buf, (size_t)n);
-        h->stats.requests_ok++;
+        // Leader: hold connection, push to peers, ACK on first confirmation
         h->stats.dag_inserts++;
-
-        push_node_to_peers(h, node);
+        push_node_to_peers_confirmed(h, conn, node);
     } else {
         // Follower: confirmed push
         h->stats.dag_inserts++;
@@ -840,9 +896,36 @@ void handler_on_gossip(handler_t *h, int from_peer, uint8_t msg_type,
         // Push-on-write: single serialized node
         if (data && len > 0) {
             size_t consumed = 0;
-            dag_node_deserialize(h->dag, data, len, &consumed);
+            dag_node_t *node = dag_node_deserialize(h->dag, data, len, &consumed);
             // Idempotent — if we already have this node, it's a no-op
+
+            // ACK back to sender so leader writes get confirmed.
+            // Payload: the 32-byte hash of the node we just absorbed.
+            if (node) {
+                network_send_raft(h->net, from_peer, MSG_DAG_PUSH_FF_ACK,
+                                  node->hash, DAG_HASH_SIZE);
+            }
         }
+        return;
+    }
+
+    if (msg_type == MSG_DAG_PUSH_FF_ACK) {
+        // Leader receives confirmation that a peer has a pushed node.
+        // Payload: [hash:32]
+        if (!data || len < DAG_HASH_SIZE) return;
+
+        pending_push_t *pp = push_find_by_hash(h, data);
+        if (pp && pp->conn) {
+            // First confirmation — ACK the client
+            int n = protocol_fmt_ok(h->resp_buf, RESPONSE_BUF_SIZE);
+            if (n > 0) conn_send(pp->conn, h->resp_buf, (size_t)n);
+            h->stats.requests_ok++;
+            push_remove(pp);
+        } else if (pp) {
+            // Connection gone (client disconnected), just clean up
+            push_remove(pp);
+        }
+        // If pp is NULL, this is a duplicate ACK (already confirmed). Ignore.
         return;
     }
 
