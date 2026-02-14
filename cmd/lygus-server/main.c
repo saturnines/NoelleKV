@@ -371,7 +371,7 @@ int main(int argc, char **argv) {
         .node_id           = g_app.node_id,
         .num_peers         = num_peers,
         .port              = g_app.port,
-        .dag_arena_path    = dag_arena_path,
+        .dag_arena_path    = NULL, // set it to dag_arena_path
         .dag_msync_enabled = false,  // WSL: skip msync for correctness testing
         .leader_only_reads = g_app.leader_only,
         .version           = LYGUS_VERSION,
