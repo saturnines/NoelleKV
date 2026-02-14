@@ -15,8 +15,8 @@
 #include <stdio.h>
 
 
-// STATIC SCRATCH BUFFER: Avoids malloc/free on every heartbeat.
-// 128KB is enough for a large batch of entries.
+// STATIC SCRATCH BUFFER: Used for small fixed-size messages
+// (requestvote, installsnapshot). AppendEntries uses dynamic allocation.
 static uint8_t scratch_buf[131072];
 
 // ============================================================================
@@ -694,11 +694,14 @@ int glue_send_appendentries(void *ctx, int peer_id,
         }
     }
 
-    if (total_size > sizeof(scratch_buf)) {
+    // FIX #5: Dynamic allocation — DAG batches can be up to 8MB,
+    // far exceeding the 128KB static scratch buffer.
+    uint8_t *buf = malloc(total_size);
+    if (!buf) {
         return LYGUS_ERR_NOMEM;
     }
 
-    uint8_t *p = scratch_buf;
+    uint8_t *p = buf;
 
     // Serialize header field-by-field
     memcpy(p, &req->term, 8);           p += 8;
@@ -732,8 +735,10 @@ int glue_send_appendentries(void *ctx, int peer_id,
         }
     }
 
-    return network_send_raft(g->network, peer_id, MSG_APPENDENTRIES_REQ,
-                             scratch_buf, total_size);
+    int ret = network_send_raft(g->network, peer_id, MSG_APPENDENTRIES_REQ,
+                                buf, total_size);
+    free(buf);
+    return ret;
 }
 
 int glue_send_installsnapshot(void *ctx, int peer_id,
