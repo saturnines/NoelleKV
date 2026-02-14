@@ -485,7 +485,7 @@ int network_recv_raft(network_t *net, int *from_id, uint8_t *msg_type,
     }
 
     free(mail.data);
-    return (int)mail.len;
+    return (int)copy_len;
 }
 
 /**
@@ -510,7 +510,7 @@ int network_recv_gossip(network_t *net, int *from_id, uint8_t *msg_type,
     }
 
     free(mail.data);
-    return (int)mail.len;
+    return (int)copy_len;
 }
 
 int network_broadcast_inv(network_t *net, const void *key, size_t klen)
@@ -540,7 +540,7 @@ int network_recv_inv(network_t *net, int *from_id, void *key_buf, size_t buf_cap
     }
 
     free(mail.data);
-    return (int)mail.len;
+    return (int)copy_len;
 }
 
 // ============================================================================
