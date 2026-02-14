@@ -12,7 +12,7 @@ COPY . .
 RUN git submodule update --init --recursive
 
 RUN mkdir -p build && cd build && \
-    cmake .. -DCMAKE_BUILD_TYPE=Release && \
+    cmake .. -DCMAKE_BUILD_TYPE=Debug -DENABLE_ASAN=ON && \
     make -j$(nproc)
 
 
