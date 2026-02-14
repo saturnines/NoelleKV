@@ -489,12 +489,9 @@ int handler_apply_dag_batch(handler_t *h, const uint8_t *entry, size_t len) {
     // Clear the in-flight flag so the next tick/read can propose again.
     h->dag_propose_pending = false;
 
-	 // #2: Re-propose if we're leader and DAG still has nodes.
-    // Without this, nodes that arrived during the commit window
-    // get stuck until the next read or tick triggers a propose.
-	if (raft_is_leader(h->raft) && dag_count(h->dag) > 0) {
-        propose_dag_batch(h);
-    }
+    // if (raft_is_leader(h->raft) && dag_count(h->dag) > 0) {
+    //     propose_dag_batch(h);
+    // }
 
     return count;
 }
