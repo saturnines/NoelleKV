@@ -77,10 +77,7 @@
 
 // Fire-and-forget push ACK: peer confirms receipt of a pushed node.
 // Payload: [hash:32].  Leader uses this to ACK client writes.
-// NOTE: Move this to wire_format.h alongside MSG_DAG_PUSH etc.
-#ifndef MSG_DAG_PUSH_FF_ACK
-#define MSG_DAG_PUSH_FF_ACK  36
-#endif
+// Defined in wire_format.h as MSG_DAG_PUSH_FF_ACK = 38.
 
 // ============================================================================
 // Confirmed Push - pending write awaiting acknowledgement

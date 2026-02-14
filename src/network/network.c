@@ -3,7 +3,7 @@
  *
  * Uses ZeroMQ with a background thread.
  *
- * Change from original: incoming messages with types 30-35 (gossip)
+ * Change from original: incoming messages with types 30-38 (gossip)
  * are routed to a separate gossip_inbox instead of the raft_inbox.
  * This keeps Raft processing unblocked by gossip traffic.
  */
@@ -54,7 +54,7 @@ struct network {
     mailbox_t *raft_inbox;     // Incoming Raft messages (types 1-21)
     mailbox_t *raft_outbox;    // Outgoing Raft + gossip messages
     mailbox_t *inv_inbox;      // Incoming INV messages
-    mailbox_t *gossip_inbox;   // Incoming gossip messages (types 30-35)  <-- NEW
+    mailbox_t *gossip_inbox;   // Incoming gossip messages (types 30-38)  <-- NEW
 
     // Event loop notification
     lygus_notify_t *inbox_notify;

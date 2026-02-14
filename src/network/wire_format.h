@@ -39,6 +39,7 @@ extern "C" {
         MSG_DAG_PUSH            = 35,   // Push-on-write: single serialized node (fire-and-forget)
         MSG_DAG_PUSH_CONFIRMED  = 36,   // Confirmed push: [seq:8][serialized node] (follower→leader)
         MSG_DAG_PUSH_ACK        = 37,   // Push acknowledgement: [seq:8] (leader→follower)
+        MSG_DAG_PUSH_FF_ACK     = 38,   // Fire-and-forget push ACK: [hash:32] (peer→leader)
 
     } msg_type_t;
 
@@ -46,7 +47,7 @@ extern "C" {
  * Check if message type is a gossip protocol message
  */
 static inline int msg_is_gossip(uint8_t type) {
-    return type >= MSG_GOSSIP_SYNC && type <= MSG_DAG_PUSH_ACK;
+    return type >= MSG_GOSSIP_SYNC && type <= MSG_DAG_PUSH_FF_ACK;
 }
 
 // ============================================================================

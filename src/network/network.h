@@ -81,7 +81,7 @@ int network_recv_inv(network_t *net, int *from_id, void *key_buf, size_t buf_cap
 /**
  * Receive gossip message from inbox
  *
- * Gossip messages (types 30-35) arrive through the same DEALER/ROUTER
+ * Gossip messages (types 30-38) arrive through the same DEALER/ROUTER
  * transport as Raft RPCs. This function checks the inbox for gossip
  * messages specifically.
  *
