@@ -28,4 +28,4 @@ RUN mkdir -p /data
 
 EXPOSE 8080 5000 5001
 
-ENTRYPOINT ["stdbuf", "-oL", "-eL", "/app/lygus-server", "-v"]
+ENTRYPOINT ["stdbuf", "-oL", "-eL", "sh", "-c", "ulimit -s unlimited && exec /app/lygus-server -v $@", "--"]
