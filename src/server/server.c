@@ -199,6 +199,41 @@ static int dag_replay_callback(const uint8_t *entry, size_t len,
 }
 
 // ============================================================================
+// Gossip Drain
+// ============================================================================
+
+/**
+ * Drain gossip inbox, up to `limit` messages.
+ * Pass 0 for unlimited (drain everything).
+ */
+static void drain_gossip_n(server_t *srv, int limit) {
+    if (!srv->net) return;
+
+    for (int i = 0; limit == 0 || i < limit; i++) {
+        int from_id = -1;
+        uint8_t msg_type = 0;
+
+        int len = network_recv_gossip(srv->net, &from_id, &msg_type,
+                                       srv->gossip_buf, GOSSIP_RECV_BUF_SIZE);
+
+        if (len <= 0) break;  // No more gossip messages
+
+        handler_on_gossip(srv->handler, from_id, msg_type,
+                          srv->gossip_buf, (size_t)len);
+    }
+}
+
+/**
+ * Drain callback for handler — called from handle_get on
+ * the leader path before proposing a DAG batch.  Unbounded drain
+ * matches the follower ReadIndex path (server_flush_dag).
+ */
+static void server_drain_gossip_cb(void *ctx) {
+    server_t *srv = (server_t *)ctx;
+    drain_gossip_n(srv, 0);
+}
+
+// ============================================================================
 // Lifecycle
 // ============================================================================
 
@@ -248,6 +283,8 @@ server_t *server_create(const server_config_t *cfg) {
         .storage = cfg->storage,
         .kv = cfg->kv,
         .net = cfg->net,
+        .drain_gossip = server_drain_gossip_cb,
+        .drain_gossip_ctx = srv,
         .node_id = cfg->node_id,
         .num_peers = cfg->num_peers,
         .dag_max_nodes = cfg->dag_max_nodes,
@@ -400,31 +437,6 @@ static void on_conn_close(conn_t *conn, void *ctx) {
     conn_node_t *node = conn_list_find(srv, conn);
     if (node) {
         conn_list_remove(srv, node);
-    }
-}
-
-// ============================================================================
-// Gossip Drain
-// ============================================================================
-
-/**
- * Drain gossip inbox, up to `limit` messages.
- * Pass 0 for unlimited (drain everything).
- */
-static void drain_gossip_n(server_t *srv, int limit) {
-    if (!srv->net) return;
-
-    for (int i = 0; limit == 0 || i < limit; i++) {
-        int from_id = -1;
-        uint8_t msg_type = 0;
-
-        int len = network_recv_gossip(srv->net, &from_id, &msg_type,
-                                       srv->gossip_buf, GOSSIP_RECV_BUF_SIZE);
-
-        if (len <= 0) break;  // No more gossip messages
-
-        handler_on_gossip(srv->handler, from_id, msg_type,
-                          srv->gossip_buf, (size_t)len);
     }
 }
 

@@ -40,6 +40,9 @@ typedef struct network network_t;
 // Configuration
 // ============================================================================
 
+/** Callback to drain gossip inbox before proposing a batch */
+typedef void (*handler_drain_fn)(void *ctx);
+
 /**
  * Handler config
  *
@@ -53,6 +56,8 @@ typedef struct {
     storage_mgr_t   *storage;
     lygus_kv_t      *kv;
     network_t       *net;             // Network layer for gossip
+    handler_drain_fn drain_gossip;    // Drain gossip inbox (called before leader propose)
+    void            *drain_gossip_ctx;
 
     // DAG configuration
     size_t           dag_max_nodes;   // Max DAG nodes between commits (default: 65536)

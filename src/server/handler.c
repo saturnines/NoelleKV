@@ -15,7 +15,8 @@
  *           → OK to client (causal lease: leader has the write)
  *
  * Read path (leader):
- *   GET → if DAG non-empty: serialize batch, raft_propose
+ *   GET → drain gossip inbox (so pushed writes enter DAG)
+ *       → if DAG non-empty: serialize batch, raft_propose
  *       → alr_read (ReadIndex → wait for apply → serve from KV)
  *
  * Apply path (all replicas):
@@ -127,6 +128,8 @@ struct handler {
     uint32_t         timeout_ms;
     const char      *version;
     bool             leader_only;
+    handler_drain_fn drain_gossip;
+    void            *drain_gossip_ctx;
 
     // Scratch buffers
     char            *resp_buf;
@@ -235,6 +238,8 @@ handler_t *handler_create(const handler_config_t *cfg) {
     h->version = cfg->version ? cfg->version : "unknown";
     h->timeout_ms = cfg->request_timeout_ms > 0 ? cfg->request_timeout_ms : DEFAULT_TIMEOUT_MS;
     h->leader_only = cfg->leader_only_reads;
+    h->drain_gossip = cfg->drain_gossip;
+    h->drain_gossip_ctx = cfg->drain_gossip_ctx;
 
     // Create protocol context
     size_t max_key = cfg->max_key_size > 0 ? cfg->max_key_size : DEFAULT_MAX_KEY;
@@ -773,8 +778,8 @@ static void handle_status(handler_t *h, conn_t *conn) {
 /**
  * GET handler - linearizable read via ALR
  *
- * If leader and DAG has pending writes, propose batch first so the
- * ALR ReadIndex will include them in the commit.
+ * If leader: drain gossip inbox first (so pushed writes enter DAG),
+ * then propose batch if DAG non-empty, then issue ALR read.
  */
 static void handle_get(handler_t *h, conn_t *conn, const request_t *req) {
     h->stats.reads_total++;
@@ -795,8 +800,16 @@ static void handle_get(handler_t *h, conn_t *conn, const request_t *req) {
         return;
     }
 
-    if (raft_is_leader(h->raft) && dag_count(h->dag) > 0) {
-        propose_dag_batch(h);
+    if (raft_is_leader(h->raft)) {
+        // FIX #1: Drain gossip inbox so pushed writes are in the DAG
+        // before we propose the batch. Matches the follower ReadIndex
+        // path (server_flush_dag → drain_gossip_n(0)).
+        if (h->drain_gossip) {
+            h->drain_gossip(h->drain_gossip_ctx);
+        }
+        if (dag_count(h->dag) > 0) {
+            propose_dag_batch(h);
+        }
     }
 
     uint64_t now_ms = event_loop_now_ms(h->loop);
@@ -1025,6 +1038,11 @@ void handler_on_gossip(handler_t *h, int from_peer, uint8_t msg_type,
     if (msg_type == MSG_DAG_PUSH_CONFIRMED) {
         // Leader receives confirmed push from follower: [seq:8][serialized_node]
         if (!data || len <= 8) return;
+
+        // Only the leader should accept confirmed pushes.
+        // If we lost leadership, reject — the follower will timeout
+        // and retry to the new leader.
+        if (!raft_is_leader(h->raft)) return;
 
         uint64_t seq;
         memcpy(&seq, data, 8);
