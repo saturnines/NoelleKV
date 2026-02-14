@@ -640,6 +640,12 @@ int glue_snapshot_restore(void *ctx, uint64_t index, uint64_t term) {
                                            g->snapshot_recv_len,
                                            index, term);
 
+    // #3: Wipe DAG so stale pre-snapshot writes can't be proposed
+    // if this node later wins an election.
+    if (ret == LYGUS_OK && g->server) {
+        server_reset_dag(g->server);
+    }
+
     // Clean up receive buffer
     free(g->snapshot_recv_buf);
     g->snapshot_recv_buf = NULL;

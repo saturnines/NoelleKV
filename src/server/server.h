@@ -133,6 +133,10 @@ int server_try_apply_entry(server_t *srv, const uint8_t *entry, size_t len);
  */
 void server_flush_dag(server_t *srv);
 
+
+/** Reset DAG after snapshot install (drain gossip inbox first) */
+void server_reset_dag(server_t *srv);
+
 // ============================================================================
 // Stats
 // ============================================================================

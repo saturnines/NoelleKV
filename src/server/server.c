@@ -529,6 +529,14 @@ void server_flush_dag(server_t *srv) {
     handler_flush_dag(srv->handler);
 }
 
+void server_reset_dag(server_t *srv) {
+    if (!srv) return;
+    // Drain everything in the gossip inbox — absorb stale
+    // MSG_DAG_PUSH messages so they don't re-enter after reset.
+    drain_gossip_n(srv, 0);
+    handler_reset_dag(srv->handler);
+}
+
 // ============================================================================
 // Stats
 // ============================================================================

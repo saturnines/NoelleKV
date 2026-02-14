@@ -129,6 +129,8 @@ void handler_tick(handler_t *h, uint64_t now_ms);
 void handler_on_readindex_complete(handler_t *h, uint64_t req_id,
                                     uint64_t read_index, int err);
 
+/** Reset DAG state (snapshot install path) */
+void handler_reset_dag(handler_t *h);
 // ============================================================================
 // DAG + Gossip Hooks
 // ============================================================================
