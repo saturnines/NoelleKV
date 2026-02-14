@@ -359,6 +359,7 @@ int main(int argc, char **argv) {
     }
 
     // --- Create server (library component) ---
+	char dag_arena_path[512]; // Bad idea but whatever
     // Server internally creates handler, which creates ALR + pending
     server_config_t srv_cfg = {
         .loop              = g_app.loop,
@@ -366,10 +367,11 @@ int main(int argc, char **argv) {
         .glue_ctx          = &g_app.glue_ctx,
         .storage           = g_app.glue_ctx.storage,
         .kv                = storage_mgr_get_kv(g_app.glue_ctx.storage),
-        .net               = g_app.glue_ctx.network,   // DAG SHIT
-        .node_id           = g_app.node_id,             // DAG SHIT
-        .num_peers         = num_peers,                  // DAG SHIT
+        .net               = g_app.glue_ctx.network,
+        .node_id           = g_app.node_id,
+        .num_peers         = num_peers,
         .port              = g_app.port,
+        .dag_arena_path    = dag_arena_path,
         .leader_only_reads = g_app.leader_only,
         .version           = LYGUS_VERSION,
     };

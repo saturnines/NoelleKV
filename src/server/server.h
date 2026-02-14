@@ -66,6 +66,7 @@ typedef struct {
     size_t           dag_max_nodes;   // Max DAG nodes between commits (default: 65536)
     size_t           dag_arena_size;  // Arena bytes (default: 16MB)
     size_t           batch_buf_size;  // Batch serialization buffer (default: 8MB)
+    const char      *dag_arena_path;  // NULL = volatile, non-NULL = mmap-backed
 
     // === Benchmark mode ===
     bool             leader_only_reads;

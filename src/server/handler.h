@@ -63,6 +63,7 @@ typedef struct {
     size_t           dag_max_nodes;   // Max DAG nodes between commits (default: 65536)
     size_t           dag_arena_size;  // Arena for keys/values (default: 16MB)
     size_t           batch_buf_size;  // Scratch for batch serialization (default: 8MB)
+    const char      *dag_arena_path;
     int              node_id;         // This node's ID (for gossip)
     int              num_peers;       // Total peers in cluster
 
