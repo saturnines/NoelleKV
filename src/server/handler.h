@@ -64,6 +64,7 @@ typedef struct {
     size_t           dag_arena_size;  // Arena for keys/values (default: 16MB)
     size_t           batch_buf_size;  // Scratch for batch serialization (default: 8MB)
     const char      *dag_arena_path;
+    bool             dag_msync_enabled; // FOR WSL
     int              node_id;         // This node's ID (for gossip)
     int              num_peers;       // Total peers in cluster
 

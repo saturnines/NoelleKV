@@ -291,6 +291,7 @@ server_t *server_create(const server_config_t *cfg) {
         .dag_arena_size = cfg->dag_arena_size,
         .batch_buf_size = cfg->batch_buf_size,
 		.dag_arena_path = cfg->dag_arena_path,
+        .dag_msync_enabled = cfg->dag_msync_enabled,
         .max_pending = cfg->max_pending,
         .request_timeout_ms = cfg->request_timeout_ms,
         .alr_capacity = cfg->alr_capacity,

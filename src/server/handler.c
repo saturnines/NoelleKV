@@ -141,6 +141,7 @@ struct handler {
 
     // DAG commit state
     bool             dag_propose_pending;  // true while a batch is in Raft pipeline
+    bool             dag_msync_enabled;     // True for on, off for off
 
     // Confirmed push state
     pending_push_t   pushes[MAX_PENDING_PUSHES];
@@ -240,6 +241,7 @@ handler_t *handler_create(const handler_config_t *cfg) {
     h->leader_only = cfg->leader_only_reads;
     h->drain_gossip = cfg->drain_gossip;
     h->drain_gossip_ctx = cfg->drain_gossip_ctx;
+    h->dag_msync_enabled = cfg->dag_msync_enabled; // Flag for turning on msync or not
 
     // Create protocol context
     size_t max_key = cfg->max_key_size > 0 ? cfg->max_key_size : DEFAULT_MAX_KEY;
@@ -891,7 +893,7 @@ static void handle_put(handler_t *h, conn_t *conn, const request_t *req) {
 
     // Originator msync — flush this write to disk before pushing to peers
     size_t arena_after = arena_used(h->dag->arena);
-    if (arena_after > arena_before) {
+    if (h->dag_msync_enabled && arena_after > arena_before) {
         dag_msync(h->dag, arena_before, arena_after - arena_before);
     }
 
@@ -943,7 +945,7 @@ static void handle_del(handler_t *h, conn_t *conn, const request_t *req) {
 
 	// Originator msync
 	size_t arena_after = arena_used(h->dag->arena);
-	if (arena_after > arena_before) {
+    if (h->dag_msync_enabled && arena_after > arena_before) {
         dag_msync(h->dag, arena_before, arena_after - arena_before);
     }
 
