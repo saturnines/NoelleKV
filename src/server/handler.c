@@ -872,6 +872,9 @@ static void handle_put(handler_t *h, conn_t *conn, const request_t *req) {
     tagged_val[0] = DAG_OP_PUT;
     memcpy(tagged_val + 1, req->value, req->vlen);
 
+	// Record arena pos
+	size_t arena_before = arena_used(h->dag->arena);
+
     // Insert into DAG
     dag_node_t *node = dag_add(h->dag, req->key, req->klen,
                                 tagged_val, tagged_vlen,
@@ -884,6 +887,12 @@ static void handle_put(handler_t *h, conn_t *conn, const request_t *req) {
         if (n > 0) conn_send(conn, h->resp_buf, (size_t)n);
         h->stats.requests_error++;
         return;
+    }
+
+    // Originator msync — flush this write to disk before pushing to peers
+    size_t arena_after = arena_used(h->dag->arena);
+    if (arena_after > arena_before) {
+        dag_msync(h->dag, arena_before, arena_after - arena_before);
     }
 
     if (raft_is_leader(h->raft)) {
@@ -917,6 +926,9 @@ static void handle_del(handler_t *h, conn_t *conn, const request_t *req) {
     // Tag value with operation type: [DAG_OP_DEL]
     uint8_t del_marker = DAG_OP_DEL;
 
+
+	// Record Arena Pos
+	size_t arena_before = arena_used(h->dag->arena);
     dag_node_t *node = dag_add(h->dag, req->key, req->klen,
                                 &del_marker, 1,
                                 parent_count > 0 ? tip_buf : NULL,
@@ -927,6 +939,12 @@ static void handle_del(handler_t *h, conn_t *conn, const request_t *req) {
         if (n > 0) conn_send(conn, h->resp_buf, (size_t)n);
         h->stats.requests_error++;
         return;
+    }
+
+	// Originator msync
+	size_t arena_after = arena_used(h->dag->arena);
+	if (arena_after > arena_before) {
+        dag_msync(h->dag, arena_before, arena_after - arena_before);
     }
 
     if (raft_is_leader(h->raft)) {
