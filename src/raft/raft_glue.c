@@ -402,15 +402,41 @@ int glue_restore_raft_log(raft_glue_ctx_t *ctx, raft_t *raft) {
 
     printf("[RESTORE] set base_index=%lu\n", first - 1);
 
-    uint8_t buf[65536];
+    // Dynamic buffer — DAG batches can be up to 8MB, 64KB stack buffer overflows
+    size_t buf_cap = 65536;
+    uint8_t *buf = malloc(buf_cap);
+    if (!buf) return LYGUS_ERR_NOMEM;
 
     for (uint64_t i = first; i <= last; i++) {
         uint64_t term;
-        ssize_t len = storage_mgr_log_get(ctx->storage, i, &term, buf, sizeof(buf));
 
-        // Fail hard on gaps, a missing entry means corrupted storage
-        if (len < 0) {
+        // First call: probe the size
+        ssize_t len = storage_mgr_log_get(ctx->storage, i, &term, buf, buf_cap);
+
+        // Fail hard on gaps
+        if (len == LYGUS_ERR_KEY_NOT_FOUND || len == LYGUS_ERR_CORRUPT) {
+            free(buf);
             return LYGUS_ERR_CORRUPT;
+        }
+
+        // Buffer too small — negative return is needed size
+        if (len < 0) {
+            size_t needed = (size_t)(-len);
+            size_t new_cap = needed * 2;
+            uint8_t *new_buf = realloc(buf, new_cap);
+            if (!new_buf) {
+                free(buf);
+                return LYGUS_ERR_NOMEM;
+            }
+            buf = new_buf;
+            buf_cap = new_cap;
+
+            // Re-read with larger buffer
+            len = storage_mgr_log_get(ctx->storage, i, &term, buf, buf_cap);
+            if (len < 0) {
+                free(buf);
+                return LYGUS_ERR_CORRUPT;
+            }
         }
 
         // Determine entry type from data
@@ -428,6 +454,8 @@ int glue_restore_raft_log(raft_glue_ctx_t *ctx, raft_t *raft) {
         };
         raft_log_append_entry(&raft->log, &entry);
     }
+
+    free(buf);
 
     uint64_t applied = storage_mgr_applied_index(ctx->storage);
     raft->commit_index = applied;
