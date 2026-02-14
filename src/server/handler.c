@@ -140,7 +140,6 @@ struct handler {
     size_t           node_push_cap;
 
     // DAG commit state
-    bool             dag_propose_pending;  // true while a batch is in Raft pipeline
     bool             dag_msync_enabled;     // True for on, off for off
 
     // Confirmed push state
@@ -486,16 +485,6 @@ int handler_apply_dag_batch(handler_t *h, const uint8_t *entry, size_t len) {
 
     h->stats.dag_batches_applied++;
 
-    // Clear the in-flight flag so the next tick/read can propose again.
-    h->dag_propose_pending = false;
-
-	 // #2: Re-propose if we're leader and DAG still has nodes.
-    // Without this, nodes that arrived during the commit window
-    // get stuck until the next read or tick triggers a propose.
-	if (raft_is_leader(h->raft) && dag_count(h->dag) > 0) {
-        propose_dag_batch(h);
-    }
-
     return count;
 }
 
@@ -504,10 +493,6 @@ int handler_apply_dag_batch(handler_t *h, const uint8_t *entry, size_t len) {
 // ============================================================================
 
 static uint64_t propose_dag_batch(handler_t *h) {
-    if (h->dag_propose_pending) {
-        return 0;
-    }
-
     size_t count = dag_count(h->dag);
     if (count == 0) return 0;
 
@@ -612,7 +597,6 @@ static uint64_t propose_dag_batch(handler_t *h) {
     }
 
     free(exclude_hashes);
-    h->dag_propose_pending = true;
     h->stats.dag_batches_proposed++;
 
     return raft_get_pending_index(h->raft);
@@ -1133,9 +1117,6 @@ void handler_on_leadership_change(handler_t *h, bool is_leader) {
     if (!is_leader) {
         pending_fail_all(h->pending, LYGUS_ERR_NOT_LEADER);
         alr_on_term_change(h->alr, raft_get_term(h->raft));
-        // Clear in-flight flag — the new leader may re-commit our
-
-        h->dag_propose_pending = false;
 
         // Fail all pending pushes — leader changed, ACKs won't come
         for (int i = 0; i < MAX_PENDING_PUSHES; i++) {
@@ -1160,7 +1141,6 @@ void handler_on_term_change(handler_t *h, uint64_t new_term) {
 void handler_on_log_truncate(handler_t *h, uint64_t from_index) {
     if (!h) return;
     pending_fail_from(h->pending, from_index, LYGUS_ERR_LOG_MISMATCH);
-    h->dag_propose_pending = false;
 }
 
 void handler_on_conn_close(handler_t *h, conn_t *conn) {
@@ -1211,7 +1191,6 @@ void handler_on_readindex_complete(handler_t *h, uint64_t req_id,
 void handler_reset_dag(handler_t *h) {
     if (!h) return;
     dag_reset(h->dag);
-    h->dag_propose_pending = false;
 }
 
 // ============================================================================
