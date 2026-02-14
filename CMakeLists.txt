@@ -7,10 +7,8 @@ if(CMAKE_C_COMPILER_ID MATCHES "GNU|Clang")
 endif()
 option(ENABLE_ASAN "Enable AddressSanitizer" OFF)
 if(ENABLE_ASAN)
-    target_compile_options(lygus PUBLIC -fsanitize=address -g -O0 -fno-omit-frame-pointer)
-    target_link_options(lygus PUBLIC -fsanitize=address)
-    target_compile_options(lygus-server PUBLIC -fsanitize=address -g -O0 -fno-omit-frame-pointer)
-    target_link_options(lygus-server PUBLIC -fsanitize=address)
+    add_compile_options(-fsanitize=address -g -O0 -fno-omit-frame-pointer -U_FORTIFY_SOURCE -D_FORTIFY_SOURCE=0)
+    add_link_options(-fsanitize=address)
 endif()
 # =============================================================================
 # Dependencies
