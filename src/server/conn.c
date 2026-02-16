@@ -218,9 +218,11 @@ static void handle_write(conn_t *c) {
         c->write_pos = 0;
 
         if (c->state == CONN_STATE_CLOSING) {
+            conn_on_close_fn on_close = c->on_close;
+            void *ctx = c->ctx;
             conn_destroy(c);
-            if (c->on_close) {
-                c->on_close(c, c->ctx);
+            if (on_close) {
+                on_close(c, ctx);
             }
         } else {
             event_loop_mod(c->loop, lygus_socket_to_fd(c->sock), EV_READ);
