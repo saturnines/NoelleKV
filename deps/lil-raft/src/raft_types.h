@@ -58,7 +58,7 @@ typedef struct {
 } raft_config_t;
 
 // Sensible defaults (Raft paper recommendations)
-// Previous interval ms was 50, changing to 5.
+// Previous interval ms was 50, changing to 5
 #define RAFT_CONFIG_DEFAULT { \
     .flags                   = RAFT_FLAGS_DEFAULT, \
     .election_timeout_min_ms = 150, \
