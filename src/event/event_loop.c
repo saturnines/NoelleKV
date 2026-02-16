@@ -24,7 +24,7 @@
 #define MAX_EVENTS      256
 #define MAX_FDS         4096
 #define MAX_TIMERS      64
-#define EPOLL_TIMEOUT   10   // ms, for timer resolution
+#define EPOLL_TIMEOUT   1   // ms, for timer resolution (was 10 )
 
 // ============================================================================
 // Internal Types
