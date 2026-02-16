@@ -1207,10 +1207,9 @@ merkle_dag_t *handler_get_dag(const handler_t *h) {
  * flows through handle_get.
  */
 void handler_flush_dag(handler_t *h) {
-    if (!h) return;
-    if (raft_is_leader(h->raft) && dag_count(h->dag) > 0) {
-        propose_dag_batch(h);
-    }
+    // BUG: disabled for harness validation
+    (void)h;
+    return;
 }
 
 // ============================================================================
