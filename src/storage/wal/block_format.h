@@ -17,7 +17,7 @@ extern "C" {
 
 #define WAL_BLOCK_MAGIC   0x50444342U  // 'PDCB'
 #define WAL_BLOCK_VERSION 1
-#define WAL_BLOCK_SIZE    65536        // 64 KiB
+#define WAL_BLOCK_SIZE    (1024 * 1024)       // 1 MIB was 64 kib
 
 // Block flags
 #define WAL_FLAG_LAST_BLOCK   0x0001   // Last block in segment
