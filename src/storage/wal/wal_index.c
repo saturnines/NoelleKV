@@ -12,7 +12,7 @@ struct wal_index {
     wal_entry_loc_t *entries;    // Dynamic array of locations
     size_t           capacity;   // Allocated slots
     size_t           count;      // Used slots
-    uint64_t         first_index; // Raft index of entries[0]
+    uint64_t         first_index; // Raft index of entries[0
 };
 
 // ============================================================================
