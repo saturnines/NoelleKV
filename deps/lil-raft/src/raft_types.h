@@ -61,9 +61,9 @@ typedef struct {
 // Previous interval ms was 50, changing to 5.
 #define RAFT_CONFIG_DEFAULT { \
     .flags                   = RAFT_FLAGS_DEFAULT, \
-    .election_timeout_min_ms = 5000, \
-    .election_timeout_max_ms = 10000, \
-    .heartbeat_interval_ms   = 200, \
+    .election_timeout_min_ms = 150, \
+    .election_timeout_max_ms = 300, \
+    .heartbeat_interval_ms   = 150, \
     .max_entries_per_msg     = 64, \
     .max_bytes_per_msg       = 0, \
     .snapshot_threshold      = 10000, \
