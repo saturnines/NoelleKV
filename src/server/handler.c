@@ -491,6 +491,7 @@ int handler_apply_dag_batch(handler_t *h, const uint8_t *entry, size_t len) {
 
 static uint64_t propose_dag_batch(handler_t *h) {
     size_t count = dag_count(h->dag);
+    fprintf(stderr, "[DAG] propose_dag_batch: dag_count=%zu\n", count);
     if (count == 0) return 0;
 
     // Item 3: collect hashes of unconfirmed leader writes
@@ -528,6 +529,8 @@ static uint64_t propose_dag_batch(handler_t *h) {
     ssize_t batch_len = dag_serialize_batch_excluding(
         h->dag, h->batch_buf + 1, h->batch_buf_cap - 1,
         exclude_hashes, excl_count);
+
+    fprintf(stderr, "[DAG] batch_len=%zd excl_count=%zu\n", batch_len, excl_count);
 
     if (batch_len < 0) {
         free(exclude_hashes);
