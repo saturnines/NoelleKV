@@ -645,37 +645,25 @@ static void push_node_to_peers(handler_t *h, dag_node_t *node) {
 static void push_node_to_peers_confirmed(handler_t *h, conn_t *conn, dag_node_t *node) {
     if (!h->net || !node) goto fail;
     if (h->num_peers <= 1) {
-        // Single-node cluster: no peers to confirm. ACK immediately.
-        // (Durability is msync-only in this case, which is Item 2.)
         int n = protocol_fmt_ok(h->resp_buf, RESPONSE_BUF_SIZE);
         if (n > 0) conn_send(conn, h->resp_buf, (size_t)n);
         h->stats.requests_ok++;
         return;
     }
 
-    pending_push_t *pp = push_alloc(h);
-    if (!pp) goto fail;
-
-    // Push to all peers (reuse existing fire-and-forget path)
     push_node_to_peers(h, node);
-
-    // Stash connection — client gets ACKed when any peer confirms
-    uint64_t now_ms = event_loop_now_ms(h->loop);
-    memcpy(pp->hash, node->hash, DAG_HASH_SIZE);
-    pp->seq = 0;
-    pp->conn = conn;
-    pp->deadline_ms = now_ms + h->timeout_ms;
-    pp->active = true;
-    pp->is_leader_write = true;
+    int n = protocol_fmt_ok(h->resp_buf, RESPONSE_BUF_SIZE);
+    if (n > 0) conn_send(conn, h->resp_buf, (size_t)n);
+    h->stats.requests_ok++;
     return;
 
-fail:
-    {
-        int n = protocol_fmt_error(h->resp_buf, RESPONSE_BUF_SIZE,
-                                   "confirmed push failed");
-        if (n > 0) conn_send(conn, h->resp_buf, (size_t)n);
-        h->stats.requests_error++;
-    }
+    fail:
+        {
+            int n = protocol_fmt_error(h->resp_buf, RESPONSE_BUF_SIZE,
+                                       "confirmed push failed");
+            if (n > 0) conn_send(conn, h->resp_buf, (size_t)n);
+            h->stats.requests_error++;
+        }
 }
 
 
