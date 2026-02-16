@@ -790,17 +790,16 @@ static void handle_get(handler_t *h, conn_t *conn, const request_t *req) {
         return;
     }
 
-    if (raft_is_leader(h->raft)) {
-        // FIX #1: Drain gossip inbox so pushed writes are in the DAG
-        // before we propose the batch. Matches the follower ReadIndex
-        // path (server_flush_dag → drain_gossip_n(0)).
-        if (h->drain_gossip) {
-            h->drain_gossip(h->drain_gossip_ctx);
-        }
-        if (dag_count(h->dag) > 0) {
-            propose_dag_batch(h);
-        }
-    }
+    // BUG: drain-bypass injection. Writes in the DAG are never
+    // proposed before the read, breaking causal lease consumption.
+    // if (raft_is_leader(h->raft)) {
+    //     if (h->drain_gossip) {
+    //         h->drain_gossip(h->drain_gossip_ctx);
+    //     }
+    //     if (dag_count(h->dag) > 0) {
+    //         propose_dag_batch(h);
+    //     }
+    // }
 
     uint64_t now_ms = event_loop_now_ms(h->loop);
     lygus_err_t err = alr_read(h->alr, req->key, req->klen, conn, now_ms);
