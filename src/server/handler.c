@@ -424,7 +424,7 @@ static void apply_node_to_kv(dag_node_t *node, void *ctx) {
 
     if (op == DAG_OP_PUT && node->value_len > 1) {
         // BUG: corrupt value for harness validation
-        node->value[1] ^= 0xFF;
+        node->value[1] ^= 0x01;
         lygus_kv_put(h->kv,
                      node->key, node->key_len,
                      node->value + 1, node->value_len - 1);
