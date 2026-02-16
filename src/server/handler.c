@@ -790,16 +790,14 @@ static void handle_get(handler_t *h, conn_t *conn, const request_t *req) {
         return;
     }
 
-    // BUG: drain-bypass injection. Writes in the DAG are never
-    // proposed before the read, breaking causal lease consumption.
-    // if (raft_is_leader(h->raft)) {
-    //     if (h->drain_gossip) {
-    //         h->drain_gossip(h->drain_gossip_ctx);
-    //     }
-    //     if (dag_count(h->dag) > 0) {
-    //         propose_dag_batch(h);
-    //     }
-    // }
+    if (raft_is_leader(h->raft)) {
+        if (h->drain_gossip) {
+            h->drain_gossip(h->drain_gossip_ctx);
+        }
+        if (dag_count(h->dag) > 0) {
+            propose_dag_batch(h);
+        }
+    }
 
     uint64_t now_ms = event_loop_now_ms(h->loop);
     lygus_err_t err = alr_read(h->alr, req->key, req->klen, conn, now_ms);
@@ -1207,9 +1205,10 @@ merkle_dag_t *handler_get_dag(const handler_t *h) {
  * flows through handle_get.
  */
 void handler_flush_dag(handler_t *h) {
-    // BUG: disabled for harness validation
-    (void)h;
-    return;
+    if (!h) return;
+    if (raft_is_leader(h->raft) && dag_count(h->dag) > 0) {
+        propose_dag_batch(h);
+    }
 }
 
 // ============================================================================
