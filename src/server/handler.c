@@ -1,5 +1,5 @@
 /**
- * handler.c - Request handling with CRDT Merkle DAG + Raft integration
+ * handler.c - Request handling with PRDT Merkle DAG + Raft integration
  *
  * Write path (leader):
  *   PUT/DEL → dag_add(key, tagged_value, tips_as_parents)
