@@ -773,8 +773,6 @@ static void handle_status(handler_t *h, conn_t *conn) {
  * If leader: drain gossip inbox first (so pushed writes enter DAG),
  * then propose batch if DAG non-empty, then issue ALR read.
  */
-#define READ_VALUE_BUF_SIZE  (64 * 1024) // lol whatever.
-
 static void handle_get(handler_t *h, conn_t *conn, const request_t *req) {
     h->stats.reads_total++;
 
@@ -794,57 +792,44 @@ static void handle_get(handler_t *h, conn_t *conn, const request_t *req) {
         return;
     }
 
-    // Block reads while new leader is catching up DAG state
-    if (h->catchup.catching_up) {
-        uint64_t now = event_loop_now_ms(h->loop);
-        if (now - h->catchup.start_ms > h->catchup.timeout_ms) {
-            h->catchup.catching_up = false;
-        } else {
-            int n = protocol_fmt_error(h->resp_buf, RESPONSE_BUF_SIZE,
-                                       "leader syncing, retry");
-            if (n > 0) conn_send(conn, h->resp_buf, (size_t)n);
-            h->stats.requests_error++;
-            return;
+    // Leader: drain gossip + propose batch (capped at 200)
+    if (raft_is_leader(h->raft)) {
+        if (h->drain_gossip) {
+            h->drain_gossip(h->drain_gossip_ctx);
+        }
+        if (dag_count(h->dag) > 0) {
+            propose_dag_batch(h);
         }
     }
 
-    // Try DAG first — uncommitted but durable writes
-    dag_node_t *node = dag_get_latest(h->dag, req->key, req->klen);
+    // ALR: ReadIndex → wait for apply → serve from KV
+    uint64_t now_ms = event_loop_now_ms(h->loop);
+    lygus_err_t err = alr_read(h->alr, req->key, req->klen, conn, now_ms);
 
-    if (node) {
-        int n;
-        if (node->value_len > 1 && node->value[0] == DAG_OP_PUT) {
-            // Strip op byte
-            n = protocol_fmt_value(h->resp_buf, RESPONSE_BUF_SIZE,
-                                   node->value + 1, node->value_len - 1);
-            h->stats.requests_ok++;
-        } else if (node->value[0] == DAG_OP_DEL) {
-            n = protocol_fmt_not_found(h->resp_buf, RESPONSE_BUF_SIZE);
-            h->stats.requests_ok++;
-        } else {
-            n = protocol_fmt_error(h->resp_buf, RESPONSE_BUF_SIZE,
-                                   "corrupt dag node");
-            h->stats.requests_error++;
-        }
-        if (n > 0) conn_send(conn, h->resp_buf, (size_t)n);
+    if (err == LYGUS_OK) {
         return;
     }
 
-    // DAG miss — fall back to committed KV state
-    uint8_t val_buf[READ_VALUE_BUF_SIZE];
-    ssize_t vlen = lygus_kv_get(h->kv, req->key, req->klen,
-                                 val_buf, sizeof(val_buf));
     int n;
-    if (vlen >= 0) {
-        n = protocol_fmt_value(h->resp_buf, RESPONSE_BUF_SIZE,
-                               val_buf, (size_t)vlen);
-        h->stats.requests_ok++;
+    if (err == LYGUS_ERR_TRY_LEADER) {
+        int leader = raft_get_leader_id(h->raft);
+        if (leader >= 0) {
+            n = protocol_fmt_errorf(h->resp_buf, RESPONSE_BUF_SIZE,
+                                    "not leader, try node %d", leader);
+        } else {
+            n = protocol_fmt_error(h->resp_buf, RESPONSE_BUF_SIZE,
+                                   "not leader, leader unknown");
+        }
+    } else if (err == LYGUS_ERR_BATCH_FULL) {
+        n = protocol_fmt_error(h->resp_buf, RESPONSE_BUF_SIZE, "read queue full");
     } else {
-        n = protocol_fmt_not_found(h->resp_buf, RESPONSE_BUF_SIZE);
-        h->stats.requests_ok++;
+        n = protocol_fmt_error(h->resp_buf, RESPONSE_BUF_SIZE, lygus_strerror(err));
     }
+
     if (n > 0) conn_send(conn, h->resp_buf, (size_t)n);
+    h->stats.requests_error++;
 }
+
 
 static void handle_put(handler_t *h, conn_t *conn, const request_t *req) {
     h->stats.writes_total++;
