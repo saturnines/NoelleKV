@@ -557,8 +557,8 @@ static uint64_t propose_dag_batch(handler_t *h) {
     // ---- Selective removal instead of dag_reset ----
     // Remove only the nodes we just proposed. Unconfirmed writes survive
     // in the DAG for the next batch after their ff-push confirms.
-    if (excl_count == 0) {
-        // No exclusions — all nodes were proposed, safe to full reset
+    if (excl_count == 0 && count <= 200) {
+        // No exclusions AND everything fit in one batch — safe to full reset
         dag_reset(h->dag);
     } else {
         // Collect hashes of nodes we DID propose (everything minus excluded)
