@@ -860,7 +860,7 @@ static void handle_put(handler_t *h, conn_t *conn, const request_t *req) {
         parent_count = (uint32_t)tip_count;
     }
 
-    // Tag value with operation type: [DAG_OP_PUT][actual_value]
+    // Tag value with operation type: [DAG_OP_PUT][actual_value] e
     size_t tagged_vlen = 1 + req->vlen;
     uint8_t *tagged_val = malloc(tagged_vlen);
     if (!tagged_val) {
