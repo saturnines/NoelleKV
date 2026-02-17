@@ -46,6 +46,7 @@
 #include "dag_serial.h"
 #include "gossip.h"
 #include "dag_entry.h"
+#include "dag_key_index.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -138,6 +139,15 @@ struct handler {
 
     // DAG commit state
     bool             dag_msync_enabled;     // True for on, off for off
+
+    // This is insane
+    struct {
+        bool     catching_up;
+        int      acks_needed;
+        int      acks_received;
+        uint64_t start_ms;
+        uint64_t timeout_ms;
+    } catchup;
 
     // Confirmed push state
     pending_push_t   pushes[MAX_PENDING_PUSHES];
@@ -238,6 +248,8 @@ handler_t *handler_create(const handler_config_t *cfg) {
     h->drain_gossip = cfg->drain_gossip;
     h->drain_gossip_ctx = cfg->drain_gossip_ctx;
     h->dag_msync_enabled = cfg->dag_msync_enabled; // Flag for turning on msync or not
+    h->catchup.catching_up = false;
+    h->catchup.timeout_ms = 500;
 
     // Create protocol context
     size_t max_key = cfg->max_key_size > 0 ? cfg->max_key_size : DEFAULT_MAX_KEY;
@@ -433,31 +445,21 @@ static void apply_node_to_kv(dag_node_t *node, void *ctx) {
 
 /**
  * Apply a committed DAG batch entry from the Raft log.
- *
- * Called from the Raft glue layer when it sees entry[0] == 0xDA.
- *
- * BUG FIX: Selective removal instead of dag_reset.  Only remove
- * committed nodes from the local DAG.  Nodes that arrived via gossip
- * or client writes during the commit window survive for the next cycle.
  */
 int handler_apply_dag_batch(handler_t *h, const uint8_t *entry, size_t len) {
     if (!h || !entry || !dag_entry_is_batch(entry, len)) return -1;
 
     const uint8_t *payload = dag_entry_batch_payload(entry);
     size_t payload_len = dag_entry_batch_len(len);
-
     if (payload_len < 4) return -1;
 
-    // Deserialize into temporary DAG
     dag_reset(h->apply_dag);
-
     int count = dag_deserialize_batch(h->apply_dag, payload, payload_len);
     if (count < 0) return -1;
 
-    // Collect hashes of committed nodes BEFORE applying
+
     size_t committed_count = dag_count(h->apply_dag);
     uint8_t *committed_hashes = NULL;
-
     if (committed_count > 0) {
         committed_hashes = malloc(committed_count * DAG_HASH_SIZE);
         if (committed_hashes) {
@@ -469,19 +471,67 @@ int handler_apply_dag_batch(handler_t *h, const uint8_t *entry, size_t len) {
         }
     }
 
-    // Apply in deterministic topo order to KV state machine
+
+    typedef struct { uint8_t *key; size_t key_len; } touched_key_t;
+    touched_key_t *touched = NULL;
+    size_t touched_count = 0;
+
+    if (committed_count > 0) {
+        touched = malloc(committed_count * sizeof(touched_key_t));
+        if (touched) {
+            dag_node_t *n, *tmp;
+            HASH_ITER(hh, h->apply_dag->nodes, n, tmp) {
+                uint8_t *kcopy = malloc(n->key_len);
+                if (kcopy) {
+                    memcpy(kcopy, n->key, n->key_len);
+                    touched[touched_count].key = kcopy;
+                    touched[touched_count].key_len = n->key_len;
+                    touched_count++;
+                }
+            }
+        }
+    }
+
+
     dag_iter_topo(h->apply_dag, apply_node_to_kv, h);
 
-    // Clean up temp DAG
     dag_reset(h->apply_dag);
 
     if (committed_count > 0 && committed_hashes) {
         dag_remove_by_hashes(h->dag, committed_hashes, committed_count);
     }
+
+    // Key index invalidation:
+     // Nuke entries for every key touched by the commit
+     // Re-index any surviving DAG nodes for those keys */
+    if (touched) {
+        for (size_t i = 0; i < touched_count; i++) {
+            key_index_remove(h->dag, touched[i].key, touched[i].key_len);
+        }
+
+
+        dag_node_t *n, *tmp;
+        HASH_ITER(hh, h->dag->nodes, n, tmp) {
+            for (size_t i = 0; i < touched_count; i++) {
+                if (n->key_len == touched[i].key_len &&
+                    memcmp(n->key, touched[i].key, n->key_len) == 0) {
+                    if (n->parent_count == 0 || n->depth != 0) {
+                        key_index_update(h->dag, n);
+                    }
+                    break;
+                }
+            }
+        }
+
+        // Free Keys
+        for (size_t i = 0; i < touched_count; i++) {
+            free(touched[i].key);
+        }
+        free(touched);
+    }
+
     free(committed_hashes);
-
     h->stats.dag_batches_applied++;
-
     return count;
 }
 
@@ -493,6 +543,7 @@ static uint64_t propose_dag_batch(handler_t *h) {
     size_t count = dag_count(h->dag);
     if (count == 0) return 0;
 
+    // Exclude unconfirmed leader writes
     uint8_t *exclude_hashes = NULL;
     size_t excl_count = 0;
 
@@ -515,7 +566,6 @@ static uint64_t propose_dag_batch(handler_t *h) {
             }
         } else {
             excl_count = 0;
-            free(exclude_hashes);
             return 0;
         }
     }
@@ -538,35 +588,18 @@ static uint64_t propose_dag_batch(handler_t *h) {
     }
 
     size_t entry_len = 1 + (size_t)batch_len;
-
     int ret = raft_propose(h->raft, h->batch_buf, entry_len);
 
+    free(exclude_hashes);
+
     if (ret != 0) {
-        free(exclude_hashes);
         return 0;
     }
 
-    // Remove exactly the nodes we proposed by re-parsing the batch
-    dag_reset(h->apply_dag);
-    int proposed = dag_deserialize_batch(h->apply_dag,
-                                          h->batch_buf + 1,
-                                          (size_t)batch_len);
-    if (proposed > 0) {
-        size_t pc = dag_count(h->apply_dag);
-        uint8_t *ph = malloc(pc * DAG_HASH_SIZE);
-        if (ph) {
-            pc = dag_collect_hashes(h->apply_dag, ph, pc);
-            dag_remove_by_hashes(h->dag, ph, pc);
-            free(ph);
-        }
-    }
-    dag_reset(h->apply_dag);
-
-    free(exclude_hashes);
     h->stats.dag_batches_proposed++;
-
     return raft_get_pending_index(h->raft);
 }
+
 // ============================================================================
 // Push-on-write Gossip
 // ============================================================================
@@ -740,6 +773,8 @@ static void handle_status(handler_t *h, conn_t *conn) {
  * If leader: drain gossip inbox first (so pushed writes enter DAG),
  * then propose batch if DAG non-empty, then issue ALR read.
  */
+#define READ_VALUE_BUF_SIZE  (64 * 1024) // lol whatever.
+
 static void handle_get(handler_t *h, conn_t *conn, const request_t *req) {
     h->stats.reads_total++;
 
@@ -759,41 +794,56 @@ static void handle_get(handler_t *h, conn_t *conn, const request_t *req) {
         return;
     }
 
-    if (raft_is_leader(h->raft)) {
-        if (h->drain_gossip) {
-            h->drain_gossip(h->drain_gossip_ctx);
-        }
-        while (dag_count(h->dag) > 0) {
-            uint64_t idx = propose_dag_batch(h);
-            if (idx == 0) break;
+    // Block reads while new leader is catching up DAG state
+    if (h->catchup.catching_up) {
+        uint64_t now = event_loop_now_ms(h->loop);
+        if (now - h->catchup.start_ms > h->catchup.timeout_ms) {
+            h->catchup.catching_up = false;
+        } else {
+            int n = protocol_fmt_error(h->resp_buf, RESPONSE_BUF_SIZE,
+                                       "leader syncing, retry");
+            if (n > 0) conn_send(conn, h->resp_buf, (size_t)n);
+            h->stats.requests_error++;
+            return;
         }
     }
 
-    uint64_t now_ms = event_loop_now_ms(h->loop);
-    lygus_err_t err = alr_read(h->alr, req->key, req->klen, conn, now_ms);
+    // Try DAG first — uncommitted but durable writes
+    dag_node_t *node = dag_get_latest(h->dag, req->key, req->klen);
 
-    if (err == LYGUS_OK) {
+    if (node) {
+        int n;
+        if (node->value_len > 1 && node->value[0] == DAG_OP_PUT) {
+            // Strip op byte
+            n = protocol_fmt_value(h->resp_buf, RESPONSE_BUF_SIZE,
+                                   node->value + 1, node->value_len - 1);
+            h->stats.requests_ok++;
+        } else if (node->value[0] == DAG_OP_DEL) {
+            n = protocol_fmt_not_found(h->resp_buf, RESPONSE_BUF_SIZE);
+            h->stats.requests_ok++;
+        } else {
+            n = protocol_fmt_error(h->resp_buf, RESPONSE_BUF_SIZE,
+                                   "corrupt dag node");
+            h->stats.requests_error++;
+        }
+        if (n > 0) conn_send(conn, h->resp_buf, (size_t)n);
         return;
     }
 
+    // DAG miss — fall back to committed KV state
+    uint8_t val_buf[READ_VALUE_BUF_SIZE];
+    ssize_t vlen = lygus_kv_get(h->kv, req->key, req->klen,
+                                 val_buf, sizeof(val_buf));
     int n;
-    if (err == LYGUS_ERR_TRY_LEADER) {
-        int leader = raft_get_leader_id(h->raft);
-        if (leader >= 0) {
-            n = protocol_fmt_errorf(h->resp_buf, RESPONSE_BUF_SIZE,
-                                    "not leader, try node %d", leader);
-        } else {
-            n = protocol_fmt_error(h->resp_buf, RESPONSE_BUF_SIZE,
-                                   "not leader, leader unknown");
-        }
-    } else if (err == LYGUS_ERR_BATCH_FULL) {
-        n = protocol_fmt_error(h->resp_buf, RESPONSE_BUF_SIZE, "read queue full");
+    if (vlen >= 0) {
+        n = protocol_fmt_value(h->resp_buf, RESPONSE_BUF_SIZE,
+                               val_buf, (size_t)vlen);
+        h->stats.requests_ok++;
     } else {
-        n = protocol_fmt_error(h->resp_buf, RESPONSE_BUF_SIZE, lygus_strerror(err));
+        n = protocol_fmt_not_found(h->resp_buf, RESPONSE_BUF_SIZE);
+        h->stats.requests_ok++;
     }
-
     if (n > 0) conn_send(conn, h->resp_buf, (size_t)n);
-    h->stats.requests_error++;
 }
 
 static void handle_put(handler_t *h, conn_t *conn, const request_t *req) {
@@ -969,6 +1019,55 @@ void handler_process(handler_t *h, conn_t *conn, const char *line, size_t len) {
 // Gossip Handling
 // ============================================================================
 
+
+static void handle_catchup_req(handler_t *h, int from_peer,
+                               const uint8_t *data, size_t len) {
+    if (!data || len < 4) return;
+
+    size_t count = dag_count(h->dag);
+    if (count == 0) {
+        uint32_t zero = 0;
+        network_send_raft(h->net, from_peer, MSG_DAG_CATCHUP_RESP,
+                          (uint8_t *)&zero, 4);
+        return;
+    }
+
+    // Serialize our entire DAG and send it
+    // Leader's dag_add will dedup, so overcounting is safe
+    ssize_t wrote = dag_serialize_batch(h->dag, h->batch_buf, h->batch_buf_cap);
+    if (wrote > 0) {
+        network_send_raft(h->net, from_peer, MSG_DAG_CATCHUP_RESP,
+                          h->batch_buf, (size_t)wrote);
+    }
+}
+
+static void handle_catchup_resp(handler_t *h, int from_peer,
+                                const uint8_t *data, size_t len) {
+    (void)from_peer;
+    if (!h->catchup.catching_up) return;
+
+    // Deserialize received nodes into our DAG
+    // dag_add handles dedup, depth computation, key index updates
+    if (data && len > 4) {
+        dag_reset(h->apply_dag);
+        int count = dag_deserialize_batch(h->apply_dag, data, len);
+        if (count > 0) {
+            dag_node_t *n, *tmp;
+            HASH_ITER(hh, h->apply_dag->nodes, n, tmp) {
+                dag_add(h->dag, n->key, n->key_len,
+                        n->value, n->value_len,
+                        n->parents, n->parent_count);
+            }
+        }
+        dag_reset(h->apply_dag);
+    }
+
+    h->catchup.acks_received++;
+    if (h->catchup.acks_received >= h->catchup.acks_needed) {
+        h->catchup.catching_up = false;
+    }
+}
+
 void handler_on_gossip(handler_t *h, int from_peer, uint8_t msg_type,
                        const uint8_t *data, size_t len) {
     if (!h) return;
@@ -1053,6 +1152,16 @@ void handler_on_gossip(handler_t *h, int from_peer, uint8_t msg_type,
         return;
     }
 
+    if (msg_type == MSG_DAG_CATCHUP_REQ) {
+        handle_catchup_req(h, from_peer, data, len);
+        return;
+    }
+
+    if (msg_type == MSG_DAG_CATCHUP_RESP) {
+        handle_catchup_resp(h, from_peer, data, len);
+        return;
+    }
+
     // Anti-entropy protocol messages (30-34)
     gossip_recv(h->gossip, from_peer, msg_type, data, len,
                 gossip_send_cb, h);
@@ -1078,11 +1187,40 @@ void handler_on_apply(handler_t *h, uint64_t last_applied) {
 void handler_on_leadership_change(handler_t *h, bool is_leader) {
     if (!h) return;
 
-    if (!is_leader) {
+    if (is_leader) {
+        // Start DAG catch-up: ask all peers for their DAG nodes
+        h->catchup.catching_up = true;
+        h->catchup.acks_needed = (h->num_peers / 2);  // majority minus self
+        h->catchup.acks_received = 0;
+        h->catchup.start_ms = event_loop_now_ms(h->loop);
+
+        // Send our tip set so peers can diff
+        size_t tip_count = dag_tip_count(h->dag);
+        uint8_t tip_buf[MAX_TIP_PARENTS * DAG_HASH_SIZE];
+        if (tip_count > MAX_TIP_PARENTS) tip_count = MAX_TIP_PARENTS;
+        dag_get_tips(h->dag, tip_buf, &tip_count);
+
+        size_t msg_len = 4 + (tip_count * DAG_HASH_SIZE);
+        uint8_t *msg = malloc(msg_len);
+        if (msg) {
+            uint32_t tc = (uint32_t)tip_count;
+            memcpy(msg, &tc, 4);
+            memcpy(msg + 4, tip_buf, tip_count * DAG_HASH_SIZE);
+
+            for (int i = 0; i < h->num_peers; i++) {
+                if (i == h->node_id) continue;
+                network_send_raft(h->net, i, MSG_DAG_CATCHUP_REQ,
+                                  msg, msg_len);
+            }
+            free(msg);
+        }
+    } else {
+        // Lost leadership — cleanup
+        h->catchup.catching_up = false;
         pending_fail_all(h->pending, LYGUS_ERR_NOT_LEADER);
         alr_on_term_change(h->alr, raft_get_term(h->raft));
 
-        // Fail all pending pushes — leader changed, ACKs won't come
+        // Fail all pending pushes
         for (int i = 0; i < MAX_PENDING_PUSHES; i++) {
             pending_push_t *pp = &h->pushes[i];
             if (!pp->active) continue;
@@ -1122,6 +1260,12 @@ void handler_on_conn_close(handler_t *h, conn_t *conn) {
 
 void handler_tick(handler_t *h, uint64_t now_ms) {
     if (!h) return;
+
+    if (h->catchup.catching_up) {
+        if (now_ms - h->catchup.start_ms > h->catchup.timeout_ms) {
+            h->catchup.catching_up = false;
+        }
+    }
 
     pending_timeout_sweep(h->pending, now_ms);
     alr_timeout_sweep(h->alr, now_ms);
@@ -1176,11 +1320,8 @@ merkle_dag_t *handler_get_dag(const handler_t *h) {
  */
 void handler_flush_dag(handler_t *h) {
     if (!h) return;
-    if (raft_is_leader(h->raft)) {
-        while (dag_count(h->dag) > 0) {
-            uint64_t idx = propose_dag_batch(h);
-            if (idx == 0) break;
-        }
+    if (raft_is_leader(h->raft) && dag_count(h->dag) > 0) {
+        propose_dag_batch(h);
     }
 }
 

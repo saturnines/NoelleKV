@@ -13,6 +13,7 @@ extern "C" {
 // Message Types
 // ============================================================================
 
+
     typedef enum {
         // Raft RPCs
         MSG_REQUESTVOTE_REQ     = 1,
@@ -36,19 +37,25 @@ extern "C" {
         MSG_GOSSIP_TIPS         = 32,   // GOSSIP_TIPS
         MSG_GOSSIP_NEED_NODES   = 33,   // GOSSIP_NEED_NODES
         MSG_GOSSIP_NODES        = 34,   // GOSSIP_NODES
-        MSG_DAG_PUSH            = 35,   // Push-on-write: single serialized node (fire-and-forget)
-        MSG_DAG_PUSH_CONFIRMED  = 36,   // Confirmed push: [seq:8][serialized node] (follower→leader)
-        MSG_DAG_PUSH_ACK        = 37,   // Push acknowledgement: [seq:8] (leader→follower)
-        MSG_DAG_PUSH_FF_ACK     = 38,   // Fire-and-forget push ACK: [hash:32] (peer→leader)
+        MSG_DAG_PUSH            = 35,   // Push-on-write: single serialized node
+        MSG_DAG_PUSH_CONFIRMED  = 36,   // Confirmed push: [seq:8][serialized node]
+        MSG_DAG_PUSH_ACK        = 37,   // Push acknowledgement: [seq:8]
+        MSG_DAG_PUSH_FF_ACK     = 38,   // Fire-and-forget push ACK: [hash:32]
+
+        // ---- Frontier protocol ----
+        MSG_DAG_FRONTIER_REQ    = 39,   // Reserved for full frontier protocol (phase 2)
+        MSG_DAG_FRONTIER_RESP   = 40,   // Reserved for full frontier protocol (phase 2)
+        MSG_DAG_CATCHUP_REQ     = 41,   // New leader→peers: [tip_count:4][tips...]
+        MSG_DAG_CATCHUP_RESP    = 42,   // Peer→new leader: serialized DAG batch
 
     } msg_type_t;
 
-/**
- * Check if message type is a gossip protocol message
- */
-static inline int msg_is_gossip(uint8_t type) {
-    return type >= MSG_GOSSIP_SYNC && type <= MSG_DAG_PUSH_FF_ACK;
-}
+    /**
+     * Check if message type is a gossip/DAG protocol message
+     */
+    static inline int msg_is_gossip(uint8_t type) {
+        return type >= MSG_GOSSIP_SYNC && type <= MSG_DAG_CATCHUP_RESP;
+    }
 
 // ============================================================================
 // Wire Header
