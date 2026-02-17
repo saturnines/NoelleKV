@@ -311,14 +311,12 @@ int raft_propose(raft_t *r, const void *data, size_t len) {
     }
 
     if (r->state != RAFT_STATE_LEADER) {
-        printf("[DEBUG] propose: not leader state=%d\n", r->state);
         return RAFT_ERR_NOT_LEADER;
     }
 
     // Append to in mem log
     int ret = raft_log_append(&r->log, r->current_term, data, len);
     if (ret != RAFT_OK) {
-        printf("[DEBUG] propose: log_append=%d\n", ret);
         return ret;
     }
 
@@ -330,7 +328,6 @@ int raft_propose(raft_t *r, const void *data, size_t len) {
                                       r->current_term, data, len);
         if (ret != 0) {
             // Rollback in-memory on persist failure
-            printf("[DEBUG] propose: persist=%d\n", ret);
             raft_log_truncate_after(&r->log, index - 1);
             return RAFT_ERR_INVALID_ARG;
         }

@@ -177,8 +177,6 @@ static void on_tick(event_loop_t *loop, void *data) {
 static int apply_entry_wrapper(void *ctx, uint64_t index, uint64_t term,
                                 raft_entry_type_t type, const void *data, size_t len) {
 
-	printf("[DEBUG] apply index=%lu len=%zu byte0=0x%02X\n",
-           index, len, (data && len > 0) ? ((const uint8_t*)data)[0] : 0);
 
     // Use glue_apply_entry for ALL entries — it handles DAG batches
     // (0xDA prefix) internally and correctly advances storage_mgr's

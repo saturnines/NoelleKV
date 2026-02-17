@@ -54,7 +54,6 @@ uint64_t raft_random_election_timeout(raft_t *r) {
 void raft_become_follower(raft_t *r, uint64_t term) {
     if (!r) return;
 
-    printf("[Node %d] Became FOLLOWER for term %lu\n", r->my_id, term);
 
     r->state = RAFT_STATE_FOLLOWER;
     r->current_term = term;
@@ -99,8 +98,6 @@ void raft_become_candidate(raft_t *r) {
         memset(r->votes_for_me, 0, r->num_nodes * sizeof(int));
         r->votes_for_me[r->my_id] = 1;
     }
-
-    printf("[Node %d] Became CANDIDATE for term %lu\n", r->my_id, r->current_term);
 
     // Persist term and vote
     if (r->callbacks.persist_vote) {
