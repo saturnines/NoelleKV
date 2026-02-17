@@ -491,15 +491,11 @@ int handler_apply_dag_batch(handler_t *h, const uint8_t *entry, size_t len) {
 
 static uint64_t propose_dag_batch(handler_t *h) {
     size_t count = dag_count(h->dag);
-    fprintf(stderr, "[DAG] propose_dag_batch: dag_count=%zu\n", count);
     if (count == 0) return 0;
-
-    // Item 3: collect hashes of unconfirmed leader writes
 
     uint8_t *exclude_hashes = NULL;
     size_t excl_count = 0;
 
-    // Count pending leader writes first
     for (int i = 0; i < MAX_PENDING_PUSHES; i++) {
         if (h->pushes[i].active && h->pushes[i].is_leader_write) {
             excl_count++;
@@ -518,26 +514,22 @@ static uint64_t propose_dag_batch(handler_t *h) {
                 }
             }
         } else {
-            excl_count = 0;  // OOM fallback: propose nothing
+            excl_count = 0;
             free(exclude_hashes);
             return 0;
         }
     }
 
-    // Serialize only confirmed nodes
     h->batch_buf[0] = DAG_ENTRY_MARKER;
     ssize_t batch_len = dag_serialize_batch_excluding(
         h->dag, h->batch_buf + 1, h->batch_buf_cap - 1,
         exclude_hashes, excl_count, 200);
-
-    fprintf(stderr, "[DAG] batch_len=%zd excl_count=%zu\n", batch_len, excl_count);
 
     if (batch_len < 0) {
         free(exclude_hashes);
         return 0;
     }
 
-    // Check if batch is empty (all nodes were excluded)
     uint32_t batch_count;
     memcpy(&batch_count, h->batch_buf + 1, 4);
     if (batch_count == 0) {
@@ -554,47 +546,21 @@ static uint64_t propose_dag_batch(handler_t *h) {
         return 0;
     }
 
-    // ---- Selective removal instead of dag_reset ----
-    // Remove only the nodes we just proposed. Unconfirmed writes survive
-    // in the DAG for the next batch after their ff-push confirms.
-    if (excl_count == 0 && count <= 200) {
-        // No exclusions AND everything fit in one batch — safe to full reset
-        dag_reset(h->dag);
-    } else {
-        // Collect hashes of nodes we DID propose (everything minus excluded)
-        size_t total = dag_count(h->dag);
-        size_t proposed_max = total;  // upper bound
-        uint8_t *proposed_hashes = malloc(proposed_max * DAG_HASH_SIZE);
-        if (proposed_hashes) {
-            size_t proposed_count = dag_collect_hashes(h->dag, proposed_hashes, proposed_max);
-
-            // Filter out the excluded ones
-            size_t write_idx = 0;
-            for (size_t i = 0; i < proposed_count; i++) {
-                const uint8_t *h_ptr = proposed_hashes + (i * DAG_HASH_SIZE);
-                int excluded = 0;
-                for (size_t j = 0; j < excl_count; j++) {
-                    if (memcmp(h_ptr, exclude_hashes + (j * DAG_HASH_SIZE),
-                               DAG_HASH_SIZE) == 0) {
-                        excluded = 1;
-                        break;
-                    }
-                }
-                if (!excluded) {
-                    if (write_idx != i) {
-                        memcpy(proposed_hashes + (write_idx * DAG_HASH_SIZE),
-                               h_ptr, DAG_HASH_SIZE);
-                    }
-                    write_idx++;
-                }
-            }
-
-            if (write_idx > 0) {
-                dag_remove_by_hashes(h->dag, proposed_hashes, write_idx);
-            }
-            free(proposed_hashes);
+    // Remove exactly the nodes we proposed by re-parsing the batch
+    dag_reset(h->apply_dag);
+    int proposed = dag_deserialize_batch(h->apply_dag,
+                                          h->batch_buf + 1,
+                                          (size_t)batch_len);
+    if (proposed > 0) {
+        size_t pc = dag_count(h->apply_dag);
+        uint8_t *ph = malloc(pc * DAG_HASH_SIZE);
+        if (ph) {
+            pc = dag_collect_hashes(h->apply_dag, ph, pc);
+            dag_remove_by_hashes(h->dag, ph, pc);
+            free(ph);
         }
     }
+    dag_reset(h->apply_dag);
 
     free(exclude_hashes);
     h->stats.dag_batches_proposed++;
