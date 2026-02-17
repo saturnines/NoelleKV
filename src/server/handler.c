@@ -528,7 +528,7 @@ static uint64_t propose_dag_batch(handler_t *h) {
     h->batch_buf[0] = DAG_ENTRY_MARKER;
     ssize_t batch_len = dag_serialize_batch_excluding(
         h->dag, h->batch_buf + 1, h->batch_buf_cap - 1,
-        exclude_hashes, excl_count);
+        exclude_hashes, excl_count, 200);
 
     fprintf(stderr, "[DAG] batch_len=%zd excl_count=%zu\n", batch_len, excl_count);
 
@@ -797,8 +797,9 @@ static void handle_get(handler_t *h, conn_t *conn, const request_t *req) {
         if (h->drain_gossip) {
             h->drain_gossip(h->drain_gossip_ctx);
         }
-        if (dag_count(h->dag) > 0) {
-            propose_dag_batch(h);
+        while (dag_count(h->dag) > 0) {
+            uint64_t idx = propose_dag_batch(h);
+            if (idx == 0) break;
         }
     }
 
@@ -1209,8 +1210,11 @@ merkle_dag_t *handler_get_dag(const handler_t *h) {
  */
 void handler_flush_dag(handler_t *h) {
     if (!h) return;
-    if (raft_is_leader(h->raft) && dag_count(h->dag) > 0) {
-        propose_dag_batch(h);
+    if (raft_is_leader(h->raft)) {
+        while (dag_count(h->dag) > 0) {
+            uint64_t idx = propose_dag_batch(h);
+            if (idx == 0) break;
+        }
     }
 }
 
