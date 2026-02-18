@@ -1244,12 +1244,17 @@ void handler_on_conn_close(handler_t *h, conn_t *conn) {
     }
 }
 
+
 void handler_tick(handler_t *h, uint64_t now_ms) {
     if (!h) return;
 
-    if (raft_is_leader(h->raft) && dag_count(h->dag) > 0 && h->reads_pending) {
-        propose_dag_batch(h);
-        h->reads_pending = false;
+    if (raft_is_leader(h->raft) && dag_count(h->dag) > 0) {
+        if (h->reads_pending) {
+            propose_dag_batch(h);
+            h->reads_pending = false;
+        } else if (dag_count(h->dag) > 500) {
+            propose_dag_batch(h);
+        }
     }
 
     if (h->catchup.catching_up) {
@@ -1278,7 +1283,6 @@ void handler_tick(handler_t *h, uint64_t now_ms) {
     }
 
     gossip_tick(h->gossip, gossip_send_cb, h);
-
 }
 
 void handler_on_readindex_complete(handler_t *h, uint64_t req_id,
