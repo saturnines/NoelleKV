@@ -139,6 +139,7 @@ struct handler {
 
     // DAG commit state
     bool             dag_msync_enabled;     // True for on, off for off
+    bool             reads_pending;
 
     // This is insane
     struct {
@@ -799,6 +800,9 @@ static void handle_get(handler_t *h, conn_t *conn, const request_t *req) {
         }
     }
 
+    // experimental not sure if it will work
+    h->reads_pending = true;
+
     // ALR: ReadIndex → wait for apply → serve from KV
     uint64_t now_ms = event_loop_now_ms(h->loop);
     lygus_err_t err = alr_read(h->alr, req->key, req->klen, conn, now_ms);
@@ -1243,8 +1247,9 @@ void handler_on_conn_close(handler_t *h, conn_t *conn) {
 void handler_tick(handler_t *h, uint64_t now_ms) {
     if (!h) return;
 
-    if (raft_is_leader(h->raft) && dag_count(h->dag) > 0) {
+    if (raft_is_leader(h->raft) && dag_count(h->dag) > 0 && h->reads_pending) {
         propose_dag_batch(h);
+        h->reads_pending = false;
     }
 
     if (h->catchup.catching_up) {
