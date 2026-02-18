@@ -797,9 +797,6 @@ static void handle_get(handler_t *h, conn_t *conn, const request_t *req) {
         if (h->drain_gossip) {
             h->drain_gossip(h->drain_gossip_ctx);
         }
-        if (dag_count(h->dag) > 0) {
-            propose_dag_batch(h);
-        }
     }
 
     // ALR: ReadIndex → wait for apply → serve from KV
@@ -1245,6 +1242,10 @@ void handler_on_conn_close(handler_t *h, conn_t *conn) {
 
 void handler_tick(handler_t *h, uint64_t now_ms) {
     if (!h) return;
+
+    if (raft_is_leader(h->raft) && dag_count(h->dag) > 0) {
+        propose_dag_batch(h);
+    }
 
     if (h->catchup.catching_up) {
         if (now_ms - h->catchup.start_ms > h->catchup.timeout_ms) {
