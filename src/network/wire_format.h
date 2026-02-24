@@ -36,18 +36,27 @@ extern "C" {
         MSG_GOSSIP_TIPS         = 32,   // GOSSIP_TIPS
         MSG_GOSSIP_NEED_NODES   = 33,   // GOSSIP_NEED_NODES
         MSG_GOSSIP_NODES        = 34,   // GOSSIP_NODES
-        MSG_DAG_PUSH            = 35,   // Push-on-write: single serialized node (fire-and-forget)
-        MSG_DAG_PUSH_CONFIRMED  = 36,   // Confirmed push: [seq:8][serialized node] (follower→leader)
-        MSG_DAG_PUSH_ACK        = 37,   // Push acknowledgement: [seq:8] (leader→follower)
-        MSG_DAG_PUSH_FF_ACK     = 38,   // Fire-and-forget push ACK: [hash:32] (peer→leader)
+        MSG_DAG_PUSH            = 35,   // Push-on-write: single serialized node
+        MSG_DAG_PUSH_CONFIRMED  = 36,   // Confirmed push: [seq:8][serialized node]
+        MSG_DAG_PUSH_ACK        = 37,   // Push ACK: [seq:8]
+        MSG_DAG_PUSH_FF_ACK     = 38,   // Fire-and-forget push ACK: [hash:32]
+
+        // ---- Frontier read path ----
+        MSG_QUORUM_PING         = 39,   // Leader → peers: "am I still leader?" [term:8]
+        MSG_QUORUM_PING_ACK     = 40,   // Peer → leader: "yes" [term:8]
+
+        // ---- DAG sync (leader election) ----
+        MSG_DAG_SYNC_REQ        = 41,   // New leader → peers: "send me your DAG" [term:8]
+        MSG_DAG_SYNC_RESP       = 42,   // Peer → new leader: [term:8][dag batch...]
 
     } msg_type_t;
 
 /**
- * Check if message type is a gossip protocol message
+ * Check if message type is a gossip/DAG protocol message.
+ * These route to gossip_inbox in the network layer.
  */
 static inline int msg_is_gossip(uint8_t type) {
-    return type >= MSG_GOSSIP_SYNC && type <= MSG_DAG_PUSH_FF_ACK;
+    return type >= MSG_GOSSIP_SYNC && type <= MSG_DAG_SYNC_RESP;
 }
 
 // ============================================================================
@@ -59,24 +68,14 @@ static inline int msg_is_gossip(uint8_t type) {
 typedef struct __attribute__((packed)) {
     uint8_t  type;      // msg_type_t
     uint8_t  from_id;   // Sender node ID
-    uint8_t  _reserved[2]; // Alignment / future use
-    uint32_t len;       // Payload length (up to 4GB, practically ~8MB)
+    uint8_t  _reserved[2];
+    uint32_t len;       // Payload length
 } wire_header_t;
 
 // ============================================================================
 // Serialization Helpers
 // ============================================================================
 
-/**
- * Encode a message for sending
- *
- * @param buf       Output buffer (must be WIRE_HEADER_SIZE + payload_len)
- * @param type      Message type
- * @param from_id   Sender node ID
- * @param payload   Message payload
- * @param payload_len Payload length
- * @return Total bytes written
- */
 static inline size_t wire_encode(void *buf, uint8_t type, uint8_t from_id,
                                   const void *payload, uint32_t payload_len)
 {
@@ -84,8 +83,8 @@ static inline size_t wire_encode(void *buf, uint8_t type, uint8_t from_id,
 
     p[0] = type;
     p[1] = from_id;
-    p[2] = 0;  // reserved
-    p[3] = 0;  // reserved
+    p[2] = 0;
+    p[3] = 0;
     memcpy(p + 4, &payload_len, 4);
 
     if (payload && payload_len > 0) {
@@ -95,14 +94,6 @@ static inline size_t wire_encode(void *buf, uint8_t type, uint8_t from_id,
     return WIRE_HEADER_SIZE + payload_len;
 }
 
-/**
- * Decode a message header
- *
- * @param buf       Input buffer
- * @param len       Buffer length
- * @param hdr       Output header
- * @return Pointer to payload, or NULL if invalid
- */
 static inline const void *wire_decode(const void *buf, size_t len,
                                        wire_header_t *hdr)
 {
@@ -118,7 +109,6 @@ static inline const void *wire_decode(const void *buf, size_t len,
     hdr->_reserved[1] = 0;
     memcpy(&hdr->len, p + 4, 4);
 
-    // Validate
     if (len < WIRE_HEADER_SIZE + hdr->len) {
         return NULL;
     }
@@ -126,9 +116,6 @@ static inline const void *wire_decode(const void *buf, size_t len,
     return p + WIRE_HEADER_SIZE;
 }
 
-/**
- * Get total message size from header
- */
 static inline size_t wire_msg_size(const wire_header_t *hdr)
 {
     return WIRE_HEADER_SIZE + hdr->len;

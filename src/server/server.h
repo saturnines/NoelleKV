@@ -1,8 +1,8 @@
 /**
  * server.h - TCP server with DAG + Raft-backed request handling
  *
- * Usage unchanged from original. New DAG config fields are optional
- * and default to sensible values.
+ * Frontier design: reads served from leader DAG via quorum ping,
+ * writes via bilateral durable replication. Raft is background GC only.
  */
 
 #ifndef LYGUS_SERVER_H
@@ -39,7 +39,7 @@ typedef struct {
     raft_glue_ctx_t *glue_ctx;
     storage_mgr_t   *storage;
     lygus_kv_t      *kv;
-    network_t       *net;             // Network layer (for gossip transport)
+    network_t       *net;
 
     // === Required: Network ===
     int              port;
@@ -56,18 +56,15 @@ typedef struct {
     // === Optional: Request handling (0 = default) ===
     size_t           max_pending;
     uint32_t         request_timeout_ms;
-    uint16_t         alr_capacity;
-    size_t           alr_slab_size;
-    uint32_t         alr_timeout_ms;
 
     // === DAG configuration (0 = default) ===
-    int              node_id;         // This node's ID
-    int              num_peers;       // Total peers in cluster
-    size_t           dag_max_nodes;   // Max DAG nodes between commits (default: 65536)
-    size_t           dag_arena_size;  // Arena bytes (default: 16MB)
-    size_t           batch_buf_size;  // Batch serialization buffer (default: 8MB)
-    const char      *dag_arena_path;  // NULL = volatile, non-NULL = mmap-backed
-    bool             dag_msync_enabled;  // true = msync on write (production), false = skip (testing)
+    int              node_id;
+    int              num_peers;
+    size_t           dag_max_nodes;
+    size_t           dag_arena_size;
+    size_t           batch_buf_size;
+    const char      *dag_arena_path;
+    bool             dag_msync_enabled;
 
     // === Benchmark mode ===
     bool             leader_only_reads;
@@ -91,7 +88,7 @@ void server_destroy(server_t *srv);
  * Periodic tick - call from timer callback
  *
  * Drains gossip inbox, runs gossip anti-entropy,
- * sweeps timeouts, and handles pending completions.
+ * sweeps timeouts, and runs background drain (GC).
  */
 void server_tick(server_t *srv, uint64_t now_ms);
 
@@ -110,7 +107,7 @@ void server_on_term_change(server_t *srv, uint64_t new_term);
 /** Log truncation */
 void server_on_log_truncate(server_t *srv, uint64_t from_index);
 
-/** ReadIndex complete */
+/** ReadIndex complete (no-op in frontier — kept for glue layer compat) */
 void server_on_readindex_complete(server_t *srv, uint64_t req_id,
                                    uint64_t read_index, int err);
 
@@ -120,21 +117,14 @@ void server_on_readindex_complete(server_t *srv, uint64_t req_id,
  * Checks if the entry is a DAG batch (first byte == 0xDA).
  * If so, deserializes and applies to KV via the handler.
  * If not, returns -1 (caller should use legacy apply path).
- *
- * @return 0 if DAG batch was applied, -1 if not a DAG batch
  */
 int server_try_apply_entry(server_t *srv, const uint8_t *entry, size_t len);
 
 /**
- * Flush pending DAG writes to Raft (leader only).
- *
- * Called from the glue layer when a ReadIndex request arrives from
- * a follower.  A ReadIndex IS an observation in the Hollow Purple
- * model — some node wants to read, so we must commit pending DAG
- * writes before responding with commit_index.
+ * Flush pending DAG writes (legacy — no-op in frontier).
+ * Background drain in handler_tick replaces this.
  */
 void server_flush_dag(server_t *srv);
-
 
 /** Reset DAG after snapshot install (drain gossip inbox first) */
 void server_reset_dag(server_t *srv);

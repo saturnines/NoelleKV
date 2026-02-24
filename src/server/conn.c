@@ -220,10 +220,11 @@ static void handle_write(conn_t *c) {
         if (c->state == CONN_STATE_CLOSING) {
             conn_on_close_fn on_close = c->on_close;
             void *ctx = c->ctx;
-            conn_destroy(c);
+            c->state = CONN_STATE_CLOSED;
             if (on_close) {
                 on_close(c, ctx);
             }
+            conn_destroy(c);
         } else {
             event_loop_mod(c->loop, lygus_socket_to_fd(c->sock), EV_READ);
             c->state = CONN_STATE_READING;

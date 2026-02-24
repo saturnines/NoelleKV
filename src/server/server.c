@@ -1,10 +1,11 @@
 /**
  * server.c - TCP server implementation with DAG integration
  *
- * Changes from original:
- *   - Passes DAG config + network handle to handler
- *   - server_tick drains gossip inbox and dispatches to handler
- *   - server_try_apply_entry hooks DAG batch apply into glue layer
+ * Changes for frontier:
+ *   - Removed drain_gossip callback (handler no longer drains on read)
+ *   - Removed ALR config passthrough
+ *   - server_flush_dag is a no-op (background drain in handler_tick)
+ *   - server_on_readindex_complete is a no-op
  */
 
 #include "server.h"
@@ -34,7 +35,7 @@
 #define DEFAULT_MAX_REQUEST      (1024 * 1024)
 #define DEFAULT_BUFFER_SIZE      4096
 #define GOSSIP_RECV_BUF_SIZE     65536
-#define MAX_GOSSIP_PER_TICK      64    // Don't starve the event loop
+#define MAX_GOSSIP_PER_TICK      64
 
 // ============================================================================
 // Connection Tracking
@@ -135,18 +136,13 @@ static conn_node_t *conn_list_find(server_t *srv, conn_t *conn) {
 }
 
 // ============================================================================
-// DAG Batch Replay for WAL Recovery (Fix #4)
+// DAG Batch Replay for WAL Recovery
 // ============================================================================
 
 typedef struct {
     lygus_kv_t *kv;
 } dag_replay_ctx_t;
 
-/**
- * Apply a single DAG node to the KV store during WAL replay.
- * Same logic as handler.c:apply_node_to_kv but operates on an
- * arbitrary KV pointer (which may be a freshly-loaded snapshot).
- */
 static void replay_apply_node(dag_node_t *node, void *ctx) {
     dag_replay_ctx_t *rc = (dag_replay_ctx_t *)ctx;
     if (!node || node->value_len == 0) return;
@@ -160,27 +156,17 @@ static void replay_apply_node(dag_node_t *node, void *ctx) {
     }
 }
 
-/**
- * Callback for storage_mgr WAL replay of DAG batch entries.
- *
- * Receives the raw WAL value (which is the full Raft entry including
- * the 0xDA marker), deserializes into a temp DAG, topo-sorts, and
- * applies each operation to the provided KV store.
- */
 static int dag_replay_callback(const uint8_t *entry, size_t len,
                                 lygus_kv_t *kv, void *ctx) {
     (void)ctx;
 
     if (!entry || len == 0 || !kv) return -1;
-
-    // The WAL value is the raw Raft entry: [0xDA][batch_payload...]
     if (!dag_entry_is_batch(entry, len)) return -1;
 
     const uint8_t *payload = dag_entry_batch_payload(entry);
     size_t payload_len = dag_entry_batch_len(len);
     if (payload_len < 4) return -1;
 
-    // Temp DAG for deserialization (small — only for this single batch)
     merkle_dag_t *tmp = dag_create(65536, 16 * 1024 * 1024);
     if (!tmp) return -1;
 
@@ -190,7 +176,6 @@ static int dag_replay_callback(const uint8_t *entry, size_t len,
         return -1;
     }
 
-    // Apply in deterministic topo order
     dag_replay_ctx_t rc = { .kv = kv };
     dag_iter_topo(tmp, replay_apply_node, &rc);
 
@@ -199,7 +184,7 @@ static int dag_replay_callback(const uint8_t *entry, size_t len,
 }
 
 // ============================================================================
-// Gossip Drain
+// Gossip Drain (still needed for server_tick and server_reset_dag)
 // ============================================================================
 
 /**
@@ -216,21 +201,11 @@ static void drain_gossip_n(server_t *srv, int limit) {
         int len = network_recv_gossip(srv->net, &from_id, &msg_type,
                                        srv->gossip_buf, GOSSIP_RECV_BUF_SIZE);
 
-        if (len <= 0) break;  // No more gossip messages
+        if (len <= 0) break;
 
         handler_on_gossip(srv->handler, from_id, msg_type,
                           srv->gossip_buf, (size_t)len);
     }
-}
-
-/**
- * Drain callback for handler — called from handle_get on
- * the leader path before proposing a DAG batch.  Unbounded drain
- * matches the follower ReadIndex path (server_flush_dag).
- */
-static void server_drain_gossip_cb(void *ctx) {
-    server_t *srv = (server_t *)ctx;
-    drain_gossip_n(srv, 0);
 }
 
 // ============================================================================
@@ -275,7 +250,7 @@ server_t *server_create(const server_config_t *cfg) {
     srv->conn_cfg.on_close = on_conn_close;
     srv->conn_cfg.ctx = srv;
 
-    // Create handler with DAG config
+    // Create handler — no ALR, no drain callback
     handler_config_t handler_cfg = {
         .loop = cfg->loop,
         .raft = cfg->raft,
@@ -283,20 +258,15 @@ server_t *server_create(const server_config_t *cfg) {
         .storage = cfg->storage,
         .kv = cfg->kv,
         .net = cfg->net,
-        .drain_gossip = server_drain_gossip_cb,
-        .drain_gossip_ctx = srv,
         .node_id = cfg->node_id,
         .num_peers = cfg->num_peers,
         .dag_max_nodes = cfg->dag_max_nodes,
         .dag_arena_size = cfg->dag_arena_size,
         .batch_buf_size = cfg->batch_buf_size,
-		.dag_arena_path = cfg->dag_arena_path,
+        .dag_arena_path = cfg->dag_arena_path,
         .dag_msync_enabled = cfg->dag_msync_enabled,
         .max_pending = cfg->max_pending,
         .request_timeout_ms = cfg->request_timeout_ms,
-        .alr_capacity = cfg->alr_capacity,
-        .alr_slab_size = cfg->alr_slab_size,
-        .alr_timeout_ms = cfg->alr_timeout_ms,
         .leader_only_reads = cfg->leader_only_reads,
         .version = cfg->version,
     };
@@ -308,10 +278,7 @@ server_t *server_create(const server_config_t *cfg) {
         return NULL;
     }
 
-    // Register DAG batch replay callback so that WAL replay
-    // (triggered by log truncation below applied_index) correctly
-    // deserializes + topo-sorts DAG batches instead of storing them
-    // as raw blobs under the __dag__ sentinel key.
+    // Register DAG batch replay callback for WAL recovery
     if (srv->storage) {
         storage_mgr_set_dag_replay(srv->storage, dag_replay_callback, NULL);
     }
@@ -452,7 +419,7 @@ void server_tick(server_t *srv, uint64_t now_ms) {
     // Drain gossip inbox (bounded, don't starve event loop)
     drain_gossip_n(srv, MAX_GOSSIP_PER_TICK);
 
-    // Handler tick (timeouts, gossip anti-entropy)
+    // Handler tick (timeouts, gossip anti-entropy, background drain)
     handler_tick(srv->handler, now_ms);
 }
 
@@ -483,52 +450,24 @@ void server_on_log_truncate(server_t *srv, uint64_t from_index) {
 
 void server_on_readindex_complete(server_t *srv, uint64_t req_id,
                                    uint64_t read_index, int err) {
-    if (!srv) return;
-    handler_on_readindex_complete(srv->handler, req_id, read_index, err);
+    // Frontier: no ReadIndex. No-op kept for glue layer API compat.
+    (void)srv; (void)req_id; (void)read_index; (void)err;
 }
 
-/**
- * Try to apply a Raft log entry as a DAG batch.
- *
- * Call this from your glue layer's apply_entry callback:
- *
- *   void apply_entry(const uint8_t *entry, size_t len, void *ctx) {
- *       server_t *srv = (server_t *)ctx;
- *       if (server_try_apply_entry(srv, entry, len) == 0) {
- *           return;  // DAG batch applied
- *       }
- *       // Legacy apply path (existing glue_deserialize_put/del)
- *       ...
- *   }
- */
 int server_try_apply_entry(server_t *srv, const uint8_t *entry, size_t len) {
     if (!srv || !entry) return -1;
 
     if (!dag_entry_is_batch(entry, len)) {
-        return -1;  // Not a DAG batch, use legacy path
+        return -1;
     }
 
     return handler_apply_dag_batch(srv->handler, entry, len);
 }
 
-/**
- * Flush pending DAG writes to Raft (if leader).
- *
- * Called from the glue layer when a ReadIndex request arrives from
- * a follower.  A ReadIndex IS an observation — some node wants to
- * read, so we must commit pending writes before responding with
- * commit_index.
- *
- * Add to server.h:
- *   void server_flush_dag(server_t *srv);
- */
 void server_flush_dag(server_t *srv) {
-    if (!srv) return;
-    // UNBOUNDED drain: every push that has reached the mailbox MUST be
-    // in the DAG before we propose.  This is the drain-before-flush
-    // invariant — the foundation of the linearizability argument.
-    drain_gossip_n(srv, 0);
-    handler_flush_dag(srv->handler);
+    // Frontier: no flush-on-read. Background drain in handler_tick.
+    // No-op kept for API compat during transition.
+    (void)srv;
 }
 
 void server_reset_dag(server_t *srv) {

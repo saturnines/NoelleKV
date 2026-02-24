@@ -2,28 +2,23 @@
  * handler.c - Request handling with PRDT Merkle DAG + Raft integration
  *
  * Write path (leader):
- *   PUT/DEL → dag_add(key, tagged_value, tips_as_parents)
- *           → fire-and-forget push to all peers
+ *   PUT/DEL → dag_add → fire-and-forget push to all peers
  *           → wait for one peer MSG_DAG_PUSH_FF_ACK
- *           → OK to client (write on 2 nodes: leader + confirming peer)
+ *           → OK to client (bilateral: leader + confirming peer)
  *
  * Write path (follower):
- *   PUT/DEL → dag_add(key, tagged_value, tips_as_parents)
- *           → confirmed push to leader (MSG_DAG_PUSH_CONFIRMED)
- *           → fire-and-forget push to other peers
- *           → wait for leader ACK (MSG_DAG_PUSH_ACK)
- *           → OK to client (causal lease: leader has the write)
+ *   PUT/DEL → dag_add → confirmed push to leader + ff push to others
+ *           → wait for leader MSG_DAG_PUSH_ACK
+ *           → OK to client (bilateral: follower + leader)
  *
- * Read path (leader):
- *   GET → drain gossip inbox (so pushed writes enter DAG)
- *       → if DAG non-empty: serialize batch, raft_propose
- *       → alr_read (ReadIndex → wait for apply → serve from KV)
+ * Read path (leader — FRONTIER):
+ *   GET → send MSG_QUORUM_PING to all peers
+ *       → wait for majority MSG_QUORUM_PING_ACK
+ *       → dag_get_latest(key) → serve from DAG
+ *       → zero Raft, zero drain, zero disk I/O
  *
- * Apply path (all replicas):
- *   Raft commits batch → dag_deserialize_batch into temp DAG
- *                       → dag_iter_topo for deterministic order
- *                       → apply each op to KV state machine
- *                       → selectively prune committed nodes from local DAG
+ * Apply path (background GC only):
+ *   Periodic drain → raft_propose batch → commit → apply to KV
  */
 
 #include "handler.h"
@@ -36,13 +31,13 @@
 #include "storage/storage_mgr.h"
 #include "event/event_loop.h"
 #include "state/kv_store.h"
-#include "ALRs/alr.h"
 #include "public/lygus_errors.h"
 #include "network/network.h"
 #include "network/wire_format.h"
 
 // DAG modules
 #include "merkle_dag.h"
+#include "dag_key_index.h"
 #include "dag_serial.h"
 #include "gossip.h"
 #include "dag_entry.h"
@@ -57,8 +52,6 @@
 
 #define DEFAULT_MAX_PENDING      1024
 #define DEFAULT_TIMEOUT_MS       5000
-#define DEFAULT_ALR_CAPACITY     4096
-#define DEFAULT_ALR_SLAB         (16 * 1024 * 1024)
 #define DEFAULT_MAX_KEY          1024
 #define DEFAULT_MAX_VALUE        (1024 * 1024)
 
@@ -69,32 +62,42 @@
 #define DEFAULT_DAG_ARENA_SIZE   (16 * 1024 * 1024)
 #define DEFAULT_BATCH_BUF_SIZE   (8 * 1024 * 1024)
 
-// Max tips to use as parents for a new node
 #define MAX_TIP_PARENTS          8
-
-// Confirmed push: max outstanding writes awaiting leader ACK
 #define MAX_PENDING_PUSHES       4096
+#define DRAIN_INTERVAL_TICKS     10
 
-// Fire-and-forget push ACK: peer confirms receipt of a pushed node.
-// Payload: [hash:32].  Leader uses this to ACK client writes.
-// Defined in wire_format.h as MSG_DAG_PUSH_FF_ACK = 38.
+// Frontier read path
+#define MAX_PENDING_FRONTIER_READS  2048
+#define FRONTIER_MAX_KEY_SIZE       1024
+
+// DAG sync (leader election)
+#define MAX_SYNC_PEERS              16
+#define SYNC_PEER_HASH_INIT_CAP     4096
 
 // ============================================================================
 // Confirmed Push - pending write awaiting acknowledgement
-//
-// Used for BOTH paths:
-//   - Follower writes: keyed by seq, awaiting leader MSG_DAG_PUSH_ACK
-//   - Leader writes:   keyed by hash, awaiting peer MSG_DAG_PUSH_FF_ACK
 // ============================================================================
 
 typedef struct {
-    uint64_t    seq;            // Sequence number (follower path only)
-    uint8_t     hash[DAG_HASH_SIZE]; // Node hash (leader path only)
-    conn_t     *conn;           // Client connection to ACK when confirmed
-    uint64_t    deadline_ms;    // Timeout deadline
-    bool        active;         // Slot in use
-    bool        is_leader_write; // true = leader awaiting ff-ack, false = follower awaiting push-ack
+    uint64_t    seq;
+    uint8_t     hash[DAG_HASH_SIZE];
+    conn_t     *conn;
+    uint64_t    deadline_ms;
+    bool        active;
+    bool        is_leader_write;
 } pending_push_t;
+
+// ============================================================================
+// Frontier Read - pending read awaiting quorum ping
+// ============================================================================
+
+typedef struct {
+    conn_t     *conn;
+    uint8_t     key[FRONTIER_MAX_KEY_SIZE];
+    size_t      key_len;
+    uint64_t    deadline_ms;
+    bool        active;
+} pending_frontier_read_t;
 
 // ============================================================================
 // Internal Structure
@@ -112,12 +115,11 @@ struct handler {
     // Owned components
     protocol_ctx_t  *proto;
     pending_table_t *pending;
-    alr_t           *alr;
 
     // DAG (owned)
     merkle_dag_t    *dag;
     gossip_t        *gossip;
-    merkle_dag_t    *apply_dag;        // Temp DAG for deserializing committed batches
+    merkle_dag_t    *apply_dag;
 
     // Config
     int              node_id;
@@ -125,23 +127,43 @@ struct handler {
     uint32_t         timeout_ms;
     const char      *version;
     bool             leader_only;
-    handler_drain_fn drain_gossip;
-    void            *drain_gossip_ctx;
 
     // Scratch buffers
     char            *resp_buf;
     uint8_t         *entry_buf;
-    uint8_t         *batch_buf;        // For DAG batch serialization
+    uint8_t         *batch_buf;
     size_t           batch_buf_cap;
-    uint8_t         *node_push_buf;    // For push-on-write serialization
+    uint8_t         *node_push_buf;
     size_t           node_push_cap;
 
     // DAG commit state
-    bool             dag_msync_enabled;     // True for on, off for off
+    bool             dag_msync_enabled;
 
     // Confirmed push state
     pending_push_t   pushes[MAX_PENDING_PUSHES];
     uint64_t         next_push_seq;
+
+    // Background drain tick counter
+    uint64_t         drain_tick_count;
+    uint64_t         leader_seq_counter; // Per-term monotonic counter (§4.2)
+
+    // ---- Frontier read state ----
+    pending_frontier_read_t frontier_reads[MAX_PENDING_FRONTIER_READS];
+    bool             qping_active;      // Is a quorum ping in flight?
+    uint64_t         qping_term;        // Term of current ping
+    int              qping_acks;        // ACKs received (including self)
+    uint64_t         qping_deadline_ms; // Timeout for current ping
+
+    // ---- DAG sync on election (§6.2) ----
+    bool             leader_ready;      // false during sync, gates reads
+    bool             sync_active;       // sync in progress
+    uint64_t         sync_term;         // term of current sync
+    uint64_t         sync_deadline_ms;  // timeout for sync
+    int              sync_responses;    // peers that responded
+    bool             sync_peer_responded[MAX_SYNC_PEERS];
+    uint8_t         *sync_peer_hashes;  // flat array of hashes from peers (Bug 3)
+    size_t           sync_peer_hash_count;
+    size_t           sync_peer_hash_cap;
 
     // Stats
     handler_stats_t  stats;
@@ -152,24 +174,28 @@ struct handler {
 // ============================================================================
 
 static void on_pending_complete(const pending_entry_t *entry, int err, void *ctx);
-static void on_alr_respond(void *conn, const void *key, size_t klen,
-                           const void *val, size_t vlen,
-                           lygus_err_t err, void *ctx);
 static void gossip_send_cb(void *ctx, int to_peer, uint8_t msg_type,
                            const uint8_t *data, size_t len);
 static int gossip_pick_peer_cb(void *ctx);
-
-// Apply a single DAG node's operation to the KV state machine
 static void apply_node_to_kv(dag_node_t *node, void *ctx);
-
-// Propose current DAG as a Raft batch entry (leader only)
 static uint64_t propose_dag_batch(handler_t *h);
-
-// Push a single node to all peers
 static void push_node_to_peers(handler_t *h, dag_node_t *node);
-
-// Send confirmed push to leader, stash connection for ACK
 static void push_node_confirmed(handler_t *h, conn_t *conn, dag_node_t *node);
+
+// Frontier read helpers
+static void frontier_start_qping(handler_t *h);
+static void frontier_serve_all(handler_t *h);
+static void frontier_fail_all(handler_t *h, const char *reason);
+static void frontier_serve_one(handler_t *h, pending_frontier_read_t *r);
+
+// DAG sync helpers (leader election)
+static void sync_start(handler_t *h);
+static void sync_abort(handler_t *h);
+static void sync_handle_response(handler_t *h, int from_peer,
+                                  const uint8_t *data, size_t len);
+static void sync_complete(handler_t *h);
+static bool sync_peer_has_hash(handler_t *h, const uint8_t *hash);
+static void sync_add_peer_hash(handler_t *h, const uint8_t *hash);
 
 // ============================================================================
 // Confirmed Push Helpers
@@ -177,19 +203,16 @@ static void push_node_confirmed(handler_t *h, conn_t *conn, dag_node_t *node);
 
 static pending_push_t *push_alloc(handler_t *h) {
     for (int i = 0; i < MAX_PENDING_PUSHES; i++) {
-        if (!h->pushes[i].active) {
-            return &h->pushes[i];
-        }
+        if (!h->pushes[i].active) return &h->pushes[i];
     }
-    return NULL;  // Table full
+    return NULL;
 }
 
 static pending_push_t *push_find(handler_t *h, uint64_t seq) {
     for (int i = 0; i < MAX_PENDING_PUSHES; i++) {
         if (h->pushes[i].active && !h->pushes[i].is_leader_write
-            && h->pushes[i].seq == seq) {
+            && h->pushes[i].seq == seq)
             return &h->pushes[i];
-        }
     }
     return NULL;
 }
@@ -197,9 +220,8 @@ static pending_push_t *push_find(handler_t *h, uint64_t seq) {
 static pending_push_t *push_find_by_hash(handler_t *h, const uint8_t *hash) {
     for (int i = 0; i < MAX_PENDING_PUSHES; i++) {
         if (h->pushes[i].active && h->pushes[i].is_leader_write
-            && memcmp(h->pushes[i].hash, hash, DAG_HASH_SIZE) == 0) {
+            && memcmp(h->pushes[i].hash, hash, DAG_HASH_SIZE) == 0)
             return &h->pushes[i];
-        }
     }
     return NULL;
 }
@@ -210,6 +232,338 @@ static void push_remove(pending_push_t *pp) {
     pp->seq = 0;
     pp->is_leader_write = false;
     memset(pp->hash, 0, DAG_HASH_SIZE);
+}
+
+// ============================================================================
+// Frontier Read Helpers
+// ============================================================================
+
+/**
+ * Check if a DAG node is an unconfirmed leader write.
+ *
+ * These are writes the leader inserted locally but no peer has ACK'd
+ * yet.  The TLA+ spec excludes leaderPendingAck from safeWrites —
+ * a read must not observe a write that might vanish if the leader
+ * crashes before any peer receives it.
+ */
+static bool is_pending_leader_write(handler_t *h, const uint8_t *hash) {
+    for (int i = 0; i < MAX_PENDING_PUSHES; i++) {
+        if (h->pushes[i].active && h->pushes[i].is_leader_write
+            && memcmp(h->pushes[i].hash, hash, DAG_HASH_SIZE) == 0)
+            return true;
+    }
+    return false;
+}
+
+/**
+ * Find the latest confirmed DAG node for a key, skipping any
+ * unconfirmed leader writes.
+ *
+ * Fast path: dag_get_latest is O(1).  This O(n) scan only runs
+ * when the winner is pending — rare, and DAG size between drains
+ * is bounded by the 200-node batch cap.
+ */
+static dag_node_t *find_latest_safe(handler_t *h,
+                                     const uint8_t *key, size_t key_len) {
+    dag_node_t *best = NULL;
+    dag_node_t *node, *tmp;
+    HASH_ITER(hh, h->dag->nodes, node, tmp) {
+        if (node->key_len != key_len) continue;
+        if (memcmp(node->key, key, key_len) != 0) continue;
+        if (is_pending_leader_write(h, node->hash)) continue;
+        if (!best || dag_node_wins(node, best)) {
+            best = node;
+        }
+    }
+    return best;
+}
+
+static pending_frontier_read_t *frontier_alloc(handler_t *h) {
+    for (int i = 0; i < MAX_PENDING_FRONTIER_READS; i++) {
+        if (!h->frontier_reads[i].active) return &h->frontier_reads[i];
+    }
+    return NULL;
+}
+
+/**
+ * Start a quorum ping: send MSG_QUORUM_PING [term:8] to all peers.
+ * Self counts as 1 ACK.  Majority triggers frontier_serve_all.
+ */
+static void frontier_start_qping(handler_t *h) {
+    uint64_t term = raft_get_term(h->raft);
+    uint64_t now = event_loop_now_ms(h->loop);
+
+    h->qping_active = true;
+    h->qping_term = term;
+    h->qping_acks = 1;  // Self counts
+    h->qping_deadline_ms = now + h->timeout_ms;
+
+    // Send to all peers
+    for (int i = 0; i < h->num_peers; i++) {
+        if (i == h->node_id) continue;
+        network_send_raft(h->net, i, MSG_QUORUM_PING,
+                          (const uint8_t *)&term, 8);
+    }
+}
+
+/**
+ * Serve a single pending read from the leader's DAG.
+ *
+ * Lookup order:
+ *   1. O(1) key index (dag_get_latest)
+ *   2. If winner is an unconfirmed leader write → O(n) safe scan
+ *   3. If nothing in DAG → fall back to KV store (drained values)
+ */
+static void frontier_serve_one(handler_t *h, pending_frontier_read_t *r) {
+    if (!r->active) return;
+
+    dag_node_t *node = dag_get_latest(h->dag, r->key, r->key_len);
+
+    // Exclude unconfirmed leader writes (TLA+ safeWrites filter)
+    if (node && is_pending_leader_write(h, node->hash)) {
+        node = find_latest_safe(h, r->key, r->key_len);
+    }
+
+    int n;
+    if (node) {
+        // Serve from DAG — value[0] is op tag
+        if (node->value[0] == DAG_OP_DEL) {
+            n = protocol_fmt_not_found(h->resp_buf, RESPONSE_BUF_SIZE);
+        } else if (node->value[0] == DAG_OP_PUT && node->value_len > 1) {
+            n = protocol_fmt_value(h->resp_buf, RESPONSE_BUF_SIZE,
+                                   node->value + 1, node->value_len - 1);
+        } else {
+            n = protocol_fmt_not_found(h->resp_buf, RESPONSE_BUF_SIZE);
+        }
+    } else {
+        // Nothing in DAG (or only pending writes).
+        // Fall back to KV store which has all background-drained values.
+        uint8_t val_buf[DEFAULT_MAX_VALUE];
+        size_t vlen = lygus_kv_get(h->kv, r->key, r->key_len,
+                                    val_buf, sizeof(val_buf));
+        if (vlen > 0 && vlen < sizeof(val_buf)) {
+            n = protocol_fmt_value(h->resp_buf, RESPONSE_BUF_SIZE, val_buf, vlen);
+        } else {
+            n = protocol_fmt_not_found(h->resp_buf, RESPONSE_BUF_SIZE);
+        }
+    }
+
+    if (n > 0 && r->conn) {
+        conn_send(r->conn, h->resp_buf, (size_t)n);
+    }
+    h->stats.requests_ok++;
+
+    r->active = false;
+    r->conn = NULL;
+}
+
+/**
+ * Quorum ping succeeded — serve all queued reads and reset.
+ */
+static void frontier_serve_all(handler_t *h) {
+    for (int i = 0; i < MAX_PENDING_FRONTIER_READS; i++) {
+        if (h->frontier_reads[i].active) {
+            frontier_serve_one(h, &h->frontier_reads[i]);
+        }
+    }
+    h->qping_active = false;
+    h->qping_acks = 0;
+}
+
+/**
+ * Fail all pending frontier reads with an error message.
+ */
+static void frontier_fail_all(handler_t *h, const char *reason) {
+    for (int i = 0; i < MAX_PENDING_FRONTIER_READS; i++) {
+        pending_frontier_read_t *r = &h->frontier_reads[i];
+        if (!r->active) continue;
+        if (r->conn) {
+            int n = protocol_fmt_error(h->resp_buf, RESPONSE_BUF_SIZE, reason);
+            if (n > 0) conn_send(r->conn, h->resp_buf, (size_t)n);
+            h->stats.requests_error++;
+        }
+        r->active = false;
+        r->conn = NULL;
+    }
+    h->qping_active = false;
+    h->qping_acks = 0;
+}
+
+// ============================================================================
+// DAG Sync on Election (§6.2)
+// ============================================================================
+
+/**
+ * Track a hash as peer-confirmed (for Bug 3 guard).
+ */
+static void sync_add_peer_hash(handler_t *h, const uint8_t *hash) {
+    if (h->sync_peer_hash_count >= h->sync_peer_hash_cap) {
+        size_t new_cap = h->sync_peer_hash_cap * 2;
+        if (new_cap == 0) new_cap = SYNC_PEER_HASH_INIT_CAP;
+        uint8_t *nb = realloc(h->sync_peer_hashes, new_cap * DAG_HASH_SIZE);
+        if (!nb) return;
+        h->sync_peer_hashes = nb;
+        h->sync_peer_hash_cap = new_cap;
+    }
+    memcpy(h->sync_peer_hashes + h->sync_peer_hash_count * DAG_HASH_SIZE,
+           hash, DAG_HASH_SIZE);
+    h->sync_peer_hash_count++;
+}
+
+/**
+ * Check if a hash was seen in any peer's sync response.
+ */
+static bool sync_peer_has_hash(handler_t *h, const uint8_t *hash) {
+    for (size_t i = 0; i < h->sync_peer_hash_count; i++) {
+        if (memcmp(h->sync_peer_hashes + i * DAG_HASH_SIZE,
+                   hash, DAG_HASH_SIZE) == 0)
+            return true;
+    }
+    return false;
+}
+
+/**
+ * Start DAG sync: send MSG_DAG_SYNC_REQ to all peers.
+ *
+ * Called on leadership change. Sets leader_ready = false,
+ * blocking reads until sync completes.
+ */
+static void sync_start(handler_t *h) {
+    h->leader_ready = false;
+    h->sync_active = true;
+    h->sync_term = raft_get_term(h->raft);
+    h->sync_deadline_ms = event_loop_now_ms(h->loop) + h->timeout_ms;
+    h->sync_responses = 0;
+    h->leader_seq_counter = 0;
+
+    memset(h->sync_peer_responded, 0, sizeof(h->sync_peer_responded));
+
+    // Reset peer hash tracking
+    h->sync_peer_hash_count = 0;
+    // (keep allocated buffer for reuse)
+
+    // Single-node cluster: self is majority, complete immediately
+    int majority = (h->num_peers / 2) + 1;
+    if (majority <= 1) {
+        sync_complete(h);
+        return;
+    }
+
+    // Send sync request to all peers
+    uint64_t term = h->sync_term;
+    for (int i = 0; i < h->num_peers; i++) {
+        if (i == h->node_id) continue;
+        network_send_raft(h->net, i, MSG_DAG_SYNC_REQ,
+                          (const uint8_t *)&term, 8);
+    }
+}
+
+/**
+ * Abort in-progress sync (term change or leadership loss).
+ */
+static void sync_abort(handler_t *h) {
+    h->sync_active = false;
+    h->leader_ready = false;
+    h->sync_responses = 0;
+}
+
+/**
+ * Handle a peer's sync response: merge their DAG into ours,
+ * track peer-confirmed hashes.
+ */
+static void sync_handle_response(handler_t *h, int from_peer,
+                                  const uint8_t *data, size_t len) {
+    if (!h->sync_active) return;
+    if (len < 8) return;
+
+    // Validate term
+    uint64_t resp_term;
+    memcpy(&resp_term, data, 8);
+    if (resp_term != h->sync_term) return;
+
+    // Don't double-count
+    if (from_peer >= 0 && from_peer < MAX_SYNC_PEERS
+        && h->sync_peer_responded[from_peer])
+        return;
+
+    const uint8_t *batch_data = data + 8;
+    size_t batch_len = len - 8;
+
+    // Deserialize peer's DAG nodes one at a time so we can track hashes.
+    // Batch format: [count:4][node1][node2]...
+    if (batch_len < 4) goto count_response;
+
+    uint32_t count;
+    memcpy(&count, batch_data, 4);
+    size_t offset = 4;
+
+    for (uint32_t i = 0; i < count && offset < batch_len; i++) {
+        size_t consumed = 0;
+        dag_node_t *node = dag_node_deserialize(h->dag,
+                                                 batch_data + offset,
+                                                 batch_len - offset,
+                                                 &consumed);
+        if (!node) break;
+
+        // Track this hash as peer-confirmed
+        sync_add_peer_hash(h, node->hash);
+        offset += consumed;
+    }
+
+count_response:
+    if (from_peer >= 0 && from_peer < MAX_SYNC_PEERS) {
+        h->sync_peer_responded[from_peer] = true;
+    }
+    h->sync_responses++;
+
+    // Check majority (self + responding peers)
+    int majority = (h->num_peers / 2) + 1;
+    int total = 1 + h->sync_responses;  // +1 for self
+    if (total >= majority) {
+        sync_complete(h);
+    }
+}
+
+
+static void sync_complete(handler_t *h) {
+    uint64_t term = raft_get_term(h->raft);
+
+    // Reconstruct leader_seq_counter from max existing leader_seq.
+    uint64_t max_counter = h->leader_seq_counter;
+    dag_node_t *node, *tmp;
+    HASH_ITER(hh, h->dag->nodes, node, tmp) {
+        if (node->leader_seq > 0) {
+            uint64_t counter = node->leader_seq & 0xFFFFFFFF;
+            if (counter > max_counter) max_counter = counter;
+        }
+    }
+    h->leader_seq_counter = max_counter;
+
+    // Assign leader_seq to peer-confirmed unordered writes (§6.2 step 6).
+    // Iterate all nodes in DAG. Nodes with leader_seq == 0 that appear
+    // in peer responses are peer-confirmed → assign sequence.
+    // Nodes with leader_seq == 0 that are local-only → skip (Bug 3).
+    HASH_ITER(hh, h->dag->nodes, node, tmp) {
+        if (node->leader_seq == 0 && sync_peer_has_hash(h, node->hash)) {
+            node->leader_seq = (term << 32) | (++h->leader_seq_counter);
+        }
+    }
+
+    // Rebuild key index from scratch (sequences changed)
+    key_index_clear(h->dag);
+    HASH_ITER(hh, h->dag->nodes, node, tmp) {
+        if (node->leader_seq > 0) {
+            key_index_update(h->dag, node);
+        }
+    }
+
+    // Msync the arena if durable mode is on (sequences are in DAG node metadata)
+    if (h->dag_msync_enabled && h->dag->arena) {
+        dag_msync(h->dag, 0, arena_used(h->dag->arena));
+    }
+
+    h->sync_active = false;
+    h->leader_ready = true;
 }
 
 // ============================================================================
@@ -235,50 +589,27 @@ handler_t *handler_create(const handler_config_t *cfg) {
     h->version = cfg->version ? cfg->version : "unknown";
     h->timeout_ms = cfg->request_timeout_ms > 0 ? cfg->request_timeout_ms : DEFAULT_TIMEOUT_MS;
     h->leader_only = cfg->leader_only_reads;
-    h->drain_gossip = cfg->drain_gossip;
-    h->drain_gossip_ctx = cfg->drain_gossip_ctx;
-    h->dag_msync_enabled = cfg->dag_msync_enabled; // Flag for turning on msync or not
+    h->dag_msync_enabled = cfg->dag_msync_enabled;
 
-    // Create protocol context
     size_t max_key = cfg->max_key_size > 0 ? cfg->max_key_size : DEFAULT_MAX_KEY;
     size_t max_val = cfg->max_value_size > 0 ? cfg->max_value_size : DEFAULT_MAX_VALUE;
     h->proto = protocol_ctx_create(max_key, max_val);
     if (!h->proto) goto fail;
 
-    // Create pending table (used for batch commit tracking)
     size_t max_pending = cfg->max_pending > 0 ? cfg->max_pending : DEFAULT_MAX_PENDING;
     h->pending = pending_create(max_pending, on_pending_complete, h);
     if (!h->pending) goto fail;
 
-    // Create ALR
-    uint16_t alr_cap = cfg->alr_capacity > 0 ? cfg->alr_capacity : DEFAULT_ALR_CAPACITY;
-    size_t alr_slab = cfg->alr_slab_size > 0 ? cfg->alr_slab_size : DEFAULT_ALR_SLAB;
-    uint32_t alr_timeout = cfg->alr_timeout_ms > 0 ? cfg->alr_timeout_ms : DEFAULT_TIMEOUT_MS;
-
-    alr_config_t alr_cfg = {
-        .raft = h->raft,
-        .kv = h->kv,
-        .respond = on_alr_respond,
-        .respond_ctx = h,
-        .capacity = alr_cap,
-        .slab_size = alr_slab,
-        .timeout_ms = alr_timeout,
-    };
-    h->alr = alr_create(&alr_cfg);
-    if (!h->alr) goto fail;
-
-    // ---- DAG setup ----
+    // DAG setup
     size_t dag_max = cfg->dag_max_nodes > 0 ? cfg->dag_max_nodes : DEFAULT_DAG_MAX_NODES;
     size_t dag_arena = cfg->dag_arena_size > 0 ? cfg->dag_arena_size : DEFAULT_DAG_ARENA_SIZE;
 
     h->dag = dag_create(dag_max, dag_arena);
     if (!h->dag) goto fail;
 
-    // Temp DAG for applying committed batches (separate from write DAG)
     h->apply_dag = dag_create(dag_max, dag_arena);
     if (!h->apply_dag) goto fail;
 
-    // Gossip
     gossip_config_t gossip_cfg = {
         .node_id = cfg->node_id,
         .dag = h->dag,
@@ -288,17 +619,21 @@ handler_t *handler_create(const handler_config_t *cfg) {
     h->gossip = gossip_create(&gossip_cfg);
     if (!h->gossip) goto fail;
 
-    // Scratch buffers
     h->resp_buf = malloc(RESPONSE_BUF_SIZE);
     h->entry_buf = malloc(ENTRY_BUF_SIZE);
-
     h->batch_buf_cap = cfg->batch_buf_size > 0 ? cfg->batch_buf_size : DEFAULT_BATCH_BUF_SIZE;
     h->batch_buf = malloc(h->batch_buf_cap);
-
-    h->node_push_cap = 4096;  // Enough for a single node
+    h->node_push_cap = 4096;
     h->node_push_buf = malloc(h->node_push_cap);
 
     if (!h->resp_buf || !h->entry_buf || !h->batch_buf || !h->node_push_buf) goto fail;
+
+    // DAG sync state
+    h->leader_ready = false;
+    h->sync_active = false;
+    h->sync_peer_hashes = NULL;
+    h->sync_peer_hash_count = 0;
+    h->sync_peer_hash_cap = 0;
 
     return h;
 
@@ -315,14 +650,15 @@ void handler_destroy(handler_t *h) {
         pending_destroy(h->pending);
     }
 
-    // Fail any outstanding confirmed pushes
     for (int i = 0; i < MAX_PENDING_PUSHES; i++) {
-        if (h->pushes[i].active) {
-            push_remove(&h->pushes[i]);
-        }
+        if (h->pushes[i].active) push_remove(&h->pushes[i]);
     }
 
-    if (h->alr) alr_destroy(h->alr);
+    // Clean up frontier reads (no response — we're shutting down)
+    for (int i = 0; i < MAX_PENDING_FRONTIER_READS; i++) {
+        h->frontier_reads[i].active = false;
+    }
+
     if (h->proto) protocol_ctx_destroy(h->proto);
     if (h->gossip) gossip_destroy(h->gossip);
     if (h->dag) dag_destroy(h->dag);
@@ -332,6 +668,7 @@ void handler_destroy(handler_t *h) {
     free(h->entry_buf);
     free(h->batch_buf);
     free(h->node_push_buf);
+    free(h->sync_peer_hashes);
     free(h);
 }
 
@@ -349,12 +686,8 @@ static void gossip_send_cb(void *ctx, int to_peer, uint8_t msg_type,
 static int gossip_pick_peer_cb(void *ctx) {
     handler_t *h = (handler_t *)ctx;
     if (h->num_peers <= 1) return -1;
-
-    // Simple random peer selection (skip self)
     int peer;
-    do {
-        peer = rand() % h->num_peers;  // Assumes peer IDs are 0..num_peers-1
-    } while (peer == h->node_id);
+    do { peer = rand() % h->num_peers; } while (peer == h->node_id);
     return peer;
 }
 
@@ -363,194 +696,107 @@ static int gossip_pick_peer_cb(void *ctx) {
 // ============================================================================
 
 static void on_pending_complete(const pending_entry_t *entry, int err, void *ctx) {
-    handler_t *h = (handler_t *)ctx;
-    conn_t *conn = (conn_t *)entry->conn;
-
-    // Pending is now only used for tracking batch proposals (optional).
-    // No client response needed here — writes are ack'd immediately.
-    (void)h;
-    (void)conn;
-    (void)err;
-}
-
-static void on_alr_respond(void *conn_ptr, const void *key, size_t klen,
-                           const void *val, size_t vlen,
-                           lygus_err_t err, void *ctx) {
-    (void)key;
-    (void)klen;
-
-    handler_t *h = (handler_t *)ctx;
-    conn_t *conn = (conn_t *)conn_ptr;
-
-    if (!conn) return;
-
-    int n;
-    if (err == LYGUS_OK) {
-        n = protocol_fmt_value(h->resp_buf, RESPONSE_BUF_SIZE, val, vlen);
-        h->stats.requests_ok++;
-    } else if (err == LYGUS_ERR_KEY_NOT_FOUND) {
-        n = protocol_fmt_not_found(h->resp_buf, RESPONSE_BUF_SIZE);
-        h->stats.requests_ok++;
-    } else if (err == LYGUS_ERR_TIMEOUT) {
-        n = protocol_fmt_error(h->resp_buf, RESPONSE_BUF_SIZE, "timeout");
-        h->stats.requests_timeout++;
-    } else {
-        n = protocol_fmt_error(h->resp_buf, RESPONSE_BUF_SIZE, lygus_strerror(err));
-        h->stats.requests_error++;
-    }
-
-    if (n > 0) {
-        conn_send(conn, h->resp_buf, (size_t)n);
-    }
+    // Pending tracks background drain proposals only — no client response.
+    (void)entry; (void)err; (void)ctx;
 }
 
 // ============================================================================
 // DAG Apply Path
 // ============================================================================
 
-/**
- * Apply a single committed DAG node to the KV state machine.
- *
- * Value encoding:
- *   value[0] == DAG_OP_PUT  → kv_put(key, value[1:])
- *   value[0] == DAG_OP_DEL  → kv_del(key)
- */
 static void apply_node_to_kv(dag_node_t *node, void *ctx) {
     handler_t *h = (handler_t *)ctx;
-
     if (!node || node->value_len == 0) return;
 
     uint8_t op = node->value[0];
-
     if (op == DAG_OP_PUT && node->value_len > 1) {
-        lygus_kv_put(h->kv,
-                     node->key, node->key_len,
+        lygus_kv_put(h->kv, node->key, node->key_len,
                      node->value + 1, node->value_len - 1);
     } else if (op == DAG_OP_DEL) {
         lygus_kv_del(h->kv, node->key, node->key_len);
     }
 }
 
-/**
- * Apply a committed DAG batch entry from the Raft log.
- *
- * Called from the Raft glue layer when it sees entry[0] == 0xDA.
- *
- * BUG FIX: Selective removal instead of dag_reset.  Only remove
- * committed nodes from the local DAG.  Nodes that arrived via gossip
- * or client writes during the commit window survive for the next cycle.
- */
 int handler_apply_dag_batch(handler_t *h, const uint8_t *entry, size_t len) {
     if (!h || !entry || !dag_entry_is_batch(entry, len)) return -1;
 
     const uint8_t *payload = dag_entry_batch_payload(entry);
     size_t payload_len = dag_entry_batch_len(len);
-
     if (payload_len < 4) return -1;
 
-    // Deserialize into temporary DAG
     dag_reset(h->apply_dag);
-
     int count = dag_deserialize_batch(h->apply_dag, payload, payload_len);
     if (count < 0) return -1;
 
-    // Collect hashes of committed nodes BEFORE applying
-    size_t committed_count = dag_count(h->apply_dag);
-    uint8_t *committed_hashes = NULL;
-
-    if (committed_count > 0) {
-        committed_hashes = malloc(committed_count * DAG_HASH_SIZE);
-        if (committed_hashes) {
-            committed_count = dag_collect_hashes(h->apply_dag,
-                                                  committed_hashes,
-                                                  committed_count);
-        } else {
-            committed_count = 0;
-        }
+    size_t cc = dag_count(h->apply_dag);
+    uint8_t *ch = NULL;
+    if (cc > 0) {
+        ch = malloc(cc * DAG_HASH_SIZE);
+        if (ch) cc = dag_collect_hashes(h->apply_dag, ch, cc);
+        else cc = 0;
     }
 
-    // Apply in deterministic topo order to KV state machine
     dag_iter_topo(h->apply_dag, apply_node_to_kv, h);
-
-    // Clean up temp DAG
     dag_reset(h->apply_dag);
 
-    if (committed_count > 0 && committed_hashes) {
-        dag_remove_by_hashes(h->dag, committed_hashes, committed_count);
+    if (cc > 0 && ch) {
+        dag_remove_by_hashes(h->dag, ch, cc);
     }
-    free(committed_hashes);
+    free(ch);
 
     h->stats.dag_batches_applied++;
-
     return count;
 }
 
 // ============================================================================
-// DAG Batch Proposal
+// DAG Batch Proposal (background drain only — NEVER on read path)
 // ============================================================================
 
 static uint64_t propose_dag_batch(handler_t *h) {
     size_t count = dag_count(h->dag);
     if (count == 0) return 0;
 
-    uint8_t *exclude_hashes = NULL;
-    size_t excl_count = 0;
+    uint8_t *excl = NULL;
+    size_t ec = 0;
 
     for (int i = 0; i < MAX_PENDING_PUSHES; i++) {
-        if (h->pushes[i].active && h->pushes[i].is_leader_write) {
-            excl_count++;
-        }
+        if (h->pushes[i].active && h->pushes[i].is_leader_write) ec++;
     }
 
-    if (excl_count > 0) {
-        exclude_hashes = malloc(excl_count * DAG_HASH_SIZE);
-        if (exclude_hashes) {
+    if (ec > 0) {
+        excl = malloc(ec * DAG_HASH_SIZE);
+        if (excl) {
             size_t idx = 0;
             for (int i = 0; i < MAX_PENDING_PUSHES; i++) {
                 if (h->pushes[i].active && h->pushes[i].is_leader_write) {
-                    memcpy(exclude_hashes + (idx * DAG_HASH_SIZE),
+                    memcpy(excl + (idx * DAG_HASH_SIZE),
                            h->pushes[i].hash, DAG_HASH_SIZE);
                     idx++;
                 }
             }
         } else {
-            excl_count = 0;
-            free(exclude_hashes);
             return 0;
         }
     }
 
     h->batch_buf[0] = DAG_ENTRY_MARKER;
-    ssize_t batch_len = dag_serialize_batch_excluding(
-        h->dag, h->batch_buf + 1, h->batch_buf_cap - 1,
-        exclude_hashes, excl_count, 200);
+    ssize_t bl = dag_serialize_batch_excluding(
+        h->dag, h->batch_buf + 1, h->batch_buf_cap - 1, excl, ec, 200);
 
-    if (batch_len < 0) {
-        free(exclude_hashes);
-        return 0;
-    }
+    if (bl < 0) { free(excl); return 0; }
 
-    uint32_t batch_count;
-    memcpy(&batch_count, h->batch_buf + 1, 4);
-    if (batch_count == 0) {
-        free(exclude_hashes);
-        return 0;
-    }
+    uint32_t bc;
+    memcpy(&bc, h->batch_buf + 1, 4);
+    if (bc == 0) { free(excl); return 0; }
 
-    size_t entry_len = 1 + (size_t)batch_len;
+    size_t el = 1 + (size_t)bl;
+    int ret = raft_propose(h->raft, h->batch_buf, el);
+    if (ret != 0) { free(excl); return 0; }
 
-    int ret = raft_propose(h->raft, h->batch_buf, entry_len);
-
-    if (ret != 0) {
-        free(exclude_hashes);
-        return 0;
-    }
-
-    // Remove exactly the nodes we proposed by re-parsing the batch
+    // Remove proposed nodes from live DAG
     dag_reset(h->apply_dag);
     int proposed = dag_deserialize_batch(h->apply_dag,
-                                          h->batch_buf + 1,
-                                          (size_t)batch_len);
+                                          h->batch_buf + 1, (size_t)bl);
     if (proposed > 0) {
         size_t pc = dag_count(h->apply_dag);
         uint8_t *ph = malloc(pc * DAG_HASH_SIZE);
@@ -562,60 +808,43 @@ static uint64_t propose_dag_batch(handler_t *h) {
     }
     dag_reset(h->apply_dag);
 
-    free(exclude_hashes);
+    free(excl);
     h->stats.dag_batches_proposed++;
-
     return raft_get_pending_index(h->raft);
 }
+
 // ============================================================================
 // Push-on-write Gossip
 // ============================================================================
 
-/**
- * Broadcast a newly inserted node to all peers via PUB/SUB.
- * Fire-and-forget. Anti-entropy catches anything missed.
- */
 static void push_node_to_peers(handler_t *h, dag_node_t *node) {
     if (!h->net || !node) return;
 
     ssize_t needed = dag_node_serialized_size(node);
     if (needed <= 0) return;
 
-    // Grow push buffer if needed
     if ((size_t)needed > h->node_push_cap) {
-        size_t new_cap = (size_t)needed * 2;
-        uint8_t *new_buf = realloc(h->node_push_buf, new_cap);
-        if (!new_buf) return;
-        h->node_push_buf = new_buf;
-        h->node_push_cap = new_cap;
+        size_t nc = (size_t)needed * 2;
+        uint8_t *nb = realloc(h->node_push_buf, nc);
+        if (!nb) return;
+        h->node_push_buf = nb;
+        h->node_push_cap = nc;
     }
 
     ssize_t wrote = dag_node_serialize(node, h->node_push_buf, h->node_push_cap);
     if (wrote <= 0) return;
 
-    // Broadcast to all peers via network layer
-    // Using DEALER/ROUTER (reliable) rather than PUB/SUB
     for (int i = 0; i < h->num_peers; i++) {
         if (i == h->node_id) continue;
         network_send_raft(h->net, i, MSG_DAG_PUSH,
                           h->node_push_buf, (size_t)wrote);
     }
-
     h->stats.dag_nodes_gossiped++;
 }
 
-/**
- * Leader write: push node to all peers and stash connection.
- *
- * Client gets ACKed only when a peer sends MSG_DAG_PUSH_FF_ACK back,
- * confirming the write exists on at least two nodes (leader + peer).
- * This is Item 1: "Leader writes need confirmed push before ACK."
- */
 static void push_node_to_peers_confirmed(handler_t *h, conn_t *conn, dag_node_t *node) {
     if (!h->net || !node) goto fail;
     if (h->num_peers <= 1) {
-        // Single-node cluster: no peers to confirm. ACK immediately.
-        // (Durability is msync-only in this case, which is Item 2.)
         int n = protocol_fmt_ok(h->resp_buf, RESPONSE_BUF_SIZE);
         if (n > 0) conn_send(conn, h->resp_buf, (size_t)n);
         h->stats.requests_ok++;
@@ -625,15 +854,13 @@ static void push_node_to_peers_confirmed(handler_t *h, conn_t *conn, dag_node_t 
     pending_push_t *pp = push_alloc(h);
     if (!pp) goto fail;
 
-    // Push to all peers (reuse existing fire-and-forget path)
     push_node_to_peers(h, node);
 
-    // Stash connection — client gets ACKed when any peer confirms
-    uint64_t now_ms = event_loop_now_ms(h->loop);
+    uint64_t now = event_loop_now_ms(h->loop);
     memcpy(pp->hash, node->hash, DAG_HASH_SIZE);
     pp->seq = 0;
     pp->conn = conn;
-    pp->deadline_ms = now_ms + h->timeout_ms;
+    pp->deadline_ms = now + h->timeout_ms;
     pp->active = true;
     pp->is_leader_write = true;
     return;
@@ -647,64 +874,53 @@ fail:
     }
 }
 
-
 static void push_node_confirmed(handler_t *h, conn_t *conn, dag_node_t *node) {
     if (!h->net || !node) goto fail;
 
     int leader = raft_get_leader_id(h->raft);
     if (leader < 0) goto fail;
 
-    // Allocate a slot in the pending push table
     pending_push_t *pp = push_alloc(h);
     if (!pp) goto fail;
 
     ssize_t needed = dag_node_serialized_size(node);
     if (needed <= 0) goto fail;
 
-    // Build confirmed push payload: [seq:8][serialized_node]
     size_t total = 8 + (size_t)needed;
-
-    // Grow push buffer if needed
     if (total > h->node_push_cap) {
-        size_t new_cap = total * 2;
-        uint8_t *new_buf = realloc(h->node_push_buf, new_cap);
-        if (!new_buf) goto fail;
-        h->node_push_buf = new_buf;
-        h->node_push_cap = new_cap;
+        size_t nc = total * 2;
+        uint8_t *nb = realloc(h->node_push_buf, nc);
+        if (!nb) goto fail;
+        h->node_push_buf = nb;
+        h->node_push_cap = nc;
     }
 
     uint64_t seq = h->next_push_seq++;
-
-    // Write sequence number (little-endian)
     memcpy(h->node_push_buf, &seq, 8);
 
-    // Write serialized node after seq
-    ssize_t wrote = dag_node_serialize(node, h->node_push_buf + 8, h->node_push_cap - 8);
+    ssize_t wrote = dag_node_serialize(node, h->node_push_buf + 8,
+                                        h->node_push_cap - 8);
     if (wrote <= 0) goto fail;
 
-    // Send confirmed push to leader
     network_send_raft(h->net, leader, MSG_DAG_PUSH_CONFIRMED,
                       h->node_push_buf, 8 + (size_t)wrote);
 
-    // Fire-and-forget push to other peers (not leader, not self)
     for (int i = 0; i < h->num_peers; i++) {
         if (i == h->node_id || i == leader) continue;
         network_send_raft(h->net, i, MSG_DAG_PUSH,
                           h->node_push_buf + 8, (size_t)wrote);
     }
 
-    // Stash connection — client gets ACKed when leader responds
-    uint64_t now_ms = event_loop_now_ms(h->loop);
+    uint64_t now = event_loop_now_ms(h->loop);
     pp->seq = seq;
     pp->conn = conn;
-    pp->deadline_ms = now_ms + h->timeout_ms;
+    pp->deadline_ms = now + h->timeout_ms;
     pp->active = true;
 
     h->stats.dag_nodes_gossiped++;
     return;
 
 fail:
-    // Can't confirm — fail the client
     {
         int n = protocol_fmt_error(h->resp_buf, RESPONSE_BUF_SIZE,
                                    "confirmed push failed");
@@ -729,22 +945,22 @@ static void handle_status(handler_t *h, conn_t *conn) {
         n = protocol_fmt_follower(h->resp_buf, RESPONSE_BUF_SIZE, leader, term);
     }
 
-    if (n > 0) {
-        conn_send(conn, h->resp_buf, (size_t)n);
-    }
+    if (n > 0) conn_send(conn, h->resp_buf, (size_t)n);
 }
 
 /**
- * GET handler - linearizable read via ALR
+ * GET handler — FRONTIER read path.
  *
- * If leader: drain gossip inbox first (so pushed writes enter DAG),
- * then propose batch if DAG non-empty, then issue ALR read.
+ * 1. Verify leadership (redirect if not leader)
+ * 2. Stash conn + key in pending frontier reads
+ * 3. If no quorum ping in flight → start one
+ * 4. On majority ACK → frontier_serve_all (see handler_on_gossip)
  */
 static void handle_get(handler_t *h, conn_t *conn, const request_t *req) {
     h->stats.reads_total++;
 
-    // Leader-only mode (benchmark)
-    if (h->leader_only && !raft_is_leader(h->raft)) {
+    // Frontier: all reads go through leader
+    if (!raft_is_leader(h->raft)) {
         int leader = raft_get_leader_id(h->raft);
         int n;
         if (leader >= 0) {
@@ -759,78 +975,80 @@ static void handle_get(handler_t *h, conn_t *conn, const request_t *req) {
         return;
     }
 
-    if (raft_is_leader(h->raft)) {
-        if (h->drain_gossip) {
-            h->drain_gossip(h->drain_gossip_ctx);
-        }
-        while (dag_count(h->dag) > 0) {
-            uint64_t idx = propose_dag_batch(h);
-            if (idx == 0) break;
-        }
-    }
-
-    uint64_t now_ms = event_loop_now_ms(h->loop);
-    lygus_err_t err = alr_read(h->alr, req->key, req->klen, conn, now_ms);
-
-    if (err == LYGUS_OK) {
+    // Block reads until DAG sync completes (§6.2 leaderReady gate)
+    if (!h->leader_ready) {
+        int n = protocol_fmt_error(h->resp_buf, RESPONSE_BUF_SIZE,
+                                   "leader syncing, retry");
+        if (n > 0) conn_send(conn, h->resp_buf, (size_t)n);
+        h->stats.requests_error++;
         return;
     }
 
-    int n;
-    if (err == LYGUS_ERR_TRY_LEADER) {
-        int leader = raft_get_leader_id(h->raft);
-        if (leader >= 0) {
-            n = protocol_fmt_errorf(h->resp_buf, RESPONSE_BUF_SIZE,
-                                    "not leader, try node %d", leader);
-        } else {
-            n = protocol_fmt_error(h->resp_buf, RESPONSE_BUF_SIZE,
-                                   "not leader, leader unknown");
-        }
-    } else if (err == LYGUS_ERR_BATCH_FULL) {
-        n = protocol_fmt_error(h->resp_buf, RESPONSE_BUF_SIZE, "read queue full");
-    } else {
-        n = protocol_fmt_error(h->resp_buf, RESPONSE_BUF_SIZE, lygus_strerror(err));
+    // Bounds check
+    if (req->klen > FRONTIER_MAX_KEY_SIZE) {
+        int n = protocol_fmt_error(h->resp_buf, RESPONSE_BUF_SIZE,
+                                   "key too large");
+        if (n > 0) conn_send(conn, h->resp_buf, (size_t)n);
+        h->stats.requests_error++;
+        return;
     }
 
-    if (n > 0) conn_send(conn, h->resp_buf, (size_t)n);
-    h->stats.requests_error++;
+    // Stash the read
+    pending_frontier_read_t *r = frontier_alloc(h);
+    if (!r) {
+        int n = protocol_fmt_error(h->resp_buf, RESPONSE_BUF_SIZE,
+                                   "read queue full");
+        if (n > 0) conn_send(conn, h->resp_buf, (size_t)n);
+        h->stats.requests_error++;
+        return;
+    }
+
+    r->conn = conn;
+    memcpy(r->key, req->key, req->klen);
+    r->key_len = req->klen;
+    r->deadline_ms = event_loop_now_ms(h->loop) + h->timeout_ms;
+    r->active = true;
+
+    // Start quorum ping if not already in flight
+    if (!h->qping_active) {
+        frontier_start_qping(h);
+    }
+
+    // Single-node cluster: self is majority, serve immediately
+    int majority = (h->num_peers / 2) + 1;
+    if (h->qping_acks >= majority) {
+        frontier_serve_all(h);
+    }
 }
 
 static void handle_put(handler_t *h, conn_t *conn, const request_t *req) {
     h->stats.writes_total++;
 
-    // Get current tips as parents (captures causal order)
-    size_t tip_count = dag_tip_count(h->dag);
-    uint8_t tip_buf[MAX_TIP_PARENTS * DAG_HASH_SIZE];
-    uint32_t parent_count = 0;
+    size_t tc = dag_tip_count(h->dag);
+    uint8_t tb[MAX_TIP_PARENTS * DAG_HASH_SIZE];
+    uint32_t pc = 0;
 
-    if (tip_count > 0) {
-        if (tip_count > MAX_TIP_PARENTS) tip_count = MAX_TIP_PARENTS;
-        dag_get_tips(h->dag, tip_buf, &tip_count);
-        parent_count = (uint32_t)tip_count;
+    if (tc > 0) {
+        if (tc > MAX_TIP_PARENTS) tc = MAX_TIP_PARENTS;
+        dag_get_tips(h->dag, tb, &tc);
+        pc = (uint32_t)tc;
     }
 
-    // Tag value with operation type: [DAG_OP_PUT][actual_value]
-    size_t tagged_vlen = 1 + req->vlen;
-    uint8_t *tagged_val = malloc(tagged_vlen);
-    if (!tagged_val) {
+    size_t tvl = 1 + req->vlen;
+    uint8_t *tv = malloc(tvl);
+    if (!tv) {
         int n = protocol_fmt_error(h->resp_buf, RESPONSE_BUF_SIZE, "alloc failed");
         if (n > 0) conn_send(conn, h->resp_buf, (size_t)n);
         h->stats.requests_error++;
         return;
     }
-    tagged_val[0] = DAG_OP_PUT;
-    memcpy(tagged_val + 1, req->value, req->vlen);
+    tv[0] = DAG_OP_PUT;
+    memcpy(tv + 1, req->value, req->vlen);
 
-	// Record arena pos
-	size_t arena_before = arena_used(h->dag->arena);
-
-    // Insert into DAG
+    size_t ab = arena_used(h->dag->arena);
     dag_node_t *node = dag_add(h->dag, req->key, req->klen,
-                                tagged_val, tagged_vlen,
-                                parent_count > 0 ? tip_buf : NULL,
-                                parent_count);
-    free(tagged_val);
+                                tv, tvl, pc > 0 ? tb : NULL, pc);
+    free(tv);
 
     if (!node) {
         int n = protocol_fmt_error(h->resp_buf, RESPONSE_BUF_SIZE, "dag full");
@@ -839,50 +1057,39 @@ static void handle_put(handler_t *h, conn_t *conn, const request_t *req) {
         return;
     }
 
-    // Originator msync — flush this write to disk before pushing to peers
-    size_t arena_after = arena_used(h->dag->arena);
-    if (h->dag_msync_enabled && arena_after > arena_before) {
-        dag_msync(h->dag, arena_before, arena_after - arena_before);
+    size_t aa = arena_used(h->dag->arena);
+    if (h->dag_msync_enabled && aa > ab) {
+        dag_msync(h->dag, ab, aa - ab);
     }
 
+    h->stats.dag_inserts++;
     if (raft_is_leader(h->raft)) {
-        // Leader: hold connection, push to peers, ACK on first confirmation
-        h->stats.dag_inserts++;
+        uint64_t term = raft_get_term(h->raft);
+        node->leader_seq = (term << 32) | (++h->leader_seq_counter);
+        key_index_update(h->dag, node);
         push_node_to_peers_confirmed(h, conn, node);
     } else {
-        // Follower: confirmed push — hold connection until leader ACKs
-        h->stats.dag_inserts++;
         push_node_confirmed(h, conn, node);
     }
 }
 
-/**
- * DEL handler - same as PUT but with DAG_OP_DEL marker
- */
 static void handle_del(handler_t *h, conn_t *conn, const request_t *req) {
     h->stats.writes_total++;
 
-    // Get current tips as parents
-    size_t tip_count = dag_tip_count(h->dag);
-    uint8_t tip_buf[MAX_TIP_PARENTS * DAG_HASH_SIZE];
-    uint32_t parent_count = 0;
+    size_t tc = dag_tip_count(h->dag);
+    uint8_t tb[MAX_TIP_PARENTS * DAG_HASH_SIZE];
+    uint32_t pc = 0;
 
-    if (tip_count > 0) {
-        if (tip_count > MAX_TIP_PARENTS) tip_count = MAX_TIP_PARENTS;
-        dag_get_tips(h->dag, tip_buf, &tip_count);
-        parent_count = (uint32_t)tip_count;
+    if (tc > 0) {
+        if (tc > MAX_TIP_PARENTS) tc = MAX_TIP_PARENTS;
+        dag_get_tips(h->dag, tb, &tc);
+        pc = (uint32_t)tc;
     }
 
-    // Tag value with operation type: [DAG_OP_DEL]
-    uint8_t del_marker = DAG_OP_DEL;
-
-
-	// Record Arena Pos
-	size_t arena_before = arena_used(h->dag->arena);
+    uint8_t dm = DAG_OP_DEL;
+    size_t ab = arena_used(h->dag->arena);
     dag_node_t *node = dag_add(h->dag, req->key, req->klen,
-                                &del_marker, 1,
-                                parent_count > 0 ? tip_buf : NULL,
-                                parent_count);
+                                &dm, 1, pc > 0 ? tb : NULL, pc);
 
     if (!node) {
         int n = protocol_fmt_error(h->resp_buf, RESPONSE_BUF_SIZE, "dag full");
@@ -891,19 +1098,18 @@ static void handle_del(handler_t *h, conn_t *conn, const request_t *req) {
         return;
     }
 
-	// Originator msync
-	size_t arena_after = arena_used(h->dag->arena);
-    if (h->dag_msync_enabled && arena_after > arena_before) {
-        dag_msync(h->dag, arena_before, arena_after - arena_before);
+    size_t aa = arena_used(h->dag->arena);
+    if (h->dag_msync_enabled && aa > ab) {
+        dag_msync(h->dag, ab, aa - ab);
     }
 
+    h->stats.dag_inserts++;
     if (raft_is_leader(h->raft)) {
-        // Leader: hold connection, push to peers, ACK on first confirmation
-        h->stats.dag_inserts++;
+        uint64_t term = raft_get_term(h->raft);
+        node->leader_seq = (term << 32) | (++h->leader_seq_counter);
+        key_index_update(h->dag, node);
         push_node_to_peers_confirmed(h, conn, node);
     } else {
-        // Follower: confirmed push
-        h->stats.dag_inserts++;
         push_node_confirmed(h, conn, node);
     }
 }
@@ -915,7 +1121,6 @@ void handler_process(handler_t *h, conn_t *conn, const char *line, size_t len) {
 
     request_t req;
     int err = protocol_parse(h->proto, line, len, &req);
-
     if (err != 0) {
         int n = protocol_fmt_errorf(h->resp_buf, RESPONSE_BUF_SIZE,
                                     "%s", protocol_parse_strerror(err));
@@ -929,33 +1134,21 @@ void handler_process(handler_t *h, conn_t *conn, const char *line, size_t len) {
             handle_status(h, conn);
             h->stats.requests_ok++;
             break;
-
         case REQ_PING: {
             int n = protocol_fmt_pong(h->resp_buf, RESPONSE_BUF_SIZE);
             if (n > 0) conn_send(conn, h->resp_buf, (size_t)n);
             h->stats.requests_ok++;
             break;
         }
-
         case REQ_VERSION: {
             int n = protocol_fmt_version(h->resp_buf, RESPONSE_BUF_SIZE, h->version);
             if (n > 0) conn_send(conn, h->resp_buf, (size_t)n);
             h->stats.requests_ok++;
             break;
         }
-
-        case REQ_GET:
-            handle_get(h, conn, &req);
-            break;
-
-        case REQ_PUT:
-            handle_put(h, conn, &req);
-            break;
-
-        case REQ_DEL:
-            handle_del(h, conn, &req);
-            break;
-
+        case REQ_GET:    handle_get(h, conn, &req); break;
+        case REQ_PUT:    handle_put(h, conn, &req); break;
+        case REQ_DEL:    handle_del(h, conn, &req); break;
         default: {
             int n = protocol_fmt_error(h->resp_buf, RESPONSE_BUF_SIZE, "unknown command");
             if (n > 0) conn_send(conn, h->resp_buf, (size_t)n);
@@ -966,22 +1159,111 @@ void handler_process(handler_t *h, conn_t *conn, const char *line, size_t len) {
 }
 
 // ============================================================================
-// Gossip Handling
+// Gossip + Quorum Ping Handling
 // ============================================================================
 
 void handler_on_gossip(handler_t *h, int from_peer, uint8_t msg_type,
                        const uint8_t *data, size_t len) {
     if (!h) return;
 
+    // ---- Quorum Ping (frontier read path) ----
+
+    if (msg_type == MSG_QUORUM_PING) {
+        // Peer received leadership check from leader.
+        // Respond only if term matches (haven't seen a higher term).
+        if (!data || len < 8) return;
+
+        uint64_t ping_term;
+        memcpy(&ping_term, data, 8);
+
+        uint64_t my_term = raft_get_term(h->raft);
+        if (ping_term == my_term) {
+            network_send_raft(h->net, from_peer, MSG_QUORUM_PING_ACK,
+                              (const uint8_t *)&ping_term, 8);
+        }
+        // If ping_term < my_term: don't respond.  Leader's ping
+        // will timeout and it will step down.  This is the quorum
+        // intersection argument from the TLA+ spec.
+        return;
+    }
+
+    if (msg_type == MSG_QUORUM_PING_ACK) {
+        // Leader received confirmation from a peer.
+        if (!data || len < 8) return;
+        if (!h->qping_active) return;
+
+        uint64_t ack_term;
+        memcpy(&ack_term, data, 8);
+
+        // Only count ACKs for our current ping
+        if (ack_term != h->qping_term) return;
+
+        // Verify we're still leader at this term
+        if (!raft_is_leader(h->raft)) {
+            frontier_fail_all(h, "lost leadership during read");
+            return;
+        }
+
+        h->qping_acks++;
+
+        int majority = (h->num_peers / 2) + 1;
+        if (h->qping_acks >= majority) {
+            frontier_serve_all(h);
+        }
+        return;
+    }
+
+    // ---- DAG sync (leader election) ----
+
+    if (msg_type == MSG_DAG_SYNC_REQ) {
+        // New leader wants our DAG. Respond with full batch.
+        if (!data || len < 8) return;
+
+        uint64_t req_term;
+        memcpy(&req_term, data, 8);
+
+        // Only respond if term is current (don't help stale leaders)
+        uint64_t my_term = raft_get_term(h->raft);
+        if (req_term < my_term) return;
+
+        // Serialize our entire DAG
+        ssize_t batch_size = dag_batch_serialized_size(h->dag);
+        if (batch_size <= 0) {
+            // Empty DAG — send just the term + empty batch [count=0]
+            uint8_t resp[12];
+            memcpy(resp, &req_term, 8);
+            uint32_t zero = 0;
+            memcpy(resp + 8, &zero, 4);
+            network_send_raft(h->net, from_peer, MSG_DAG_SYNC_RESP,
+                              resp, 12);
+            return;
+        }
+
+        size_t resp_len = 8 + (size_t)batch_size;
+        uint8_t *resp = malloc(resp_len);
+        if (!resp) return;
+
+        memcpy(resp, &req_term, 8);
+        ssize_t wrote = dag_serialize_batch(h->dag, resp + 8, (size_t)batch_size);
+        if (wrote > 0) {
+            network_send_raft(h->net, from_peer, MSG_DAG_SYNC_RESP,
+                              resp, 8 + (size_t)wrote);
+        }
+        free(resp);
+        return;
+    }
+
+    if (msg_type == MSG_DAG_SYNC_RESP) {
+        sync_handle_response(h, from_peer, data, len);
+        return;
+    }
+
+    // ---- Write path messages ----
+
     if (msg_type == MSG_DAG_PUSH) {
-        // Push-on-write: single serialized node
         if (data && len > 0) {
             size_t consumed = 0;
             dag_node_t *node = dag_node_deserialize(h->dag, data, len, &consumed);
-            // Idempotent — if we already have this node, it's a no-op
-
-            // ACK back to sender so leader writes get confirmed.
-            // Payload: the 32-byte hash of the node we just absorbed.
             if (node) {
                 network_send_raft(h->net, from_peer, MSG_DAG_PUSH_FF_ACK,
                                   node->hash, DAG_HASH_SIZE);
@@ -991,49 +1273,40 @@ void handler_on_gossip(handler_t *h, int from_peer, uint8_t msg_type,
     }
 
     if (msg_type == MSG_DAG_PUSH_FF_ACK) {
-        // Leader receives confirmation that a peer has a pushed node.
-        // Payload: [hash:32]
         if (!data || len < DAG_HASH_SIZE) return;
-
         pending_push_t *pp = push_find_by_hash(h, data);
         if (pp && pp->conn) {
-            // First confirmation — ACK the client
             int n = protocol_fmt_ok(h->resp_buf, RESPONSE_BUF_SIZE);
             if (n > 0) conn_send(pp->conn, h->resp_buf, (size_t)n);
             h->stats.requests_ok++;
             push_remove(pp);
         } else if (pp) {
-            // Connection gone (client disconnected), just clean up
             push_remove(pp);
         }
-        // If pp is NULL, this is a duplicate ACK (already confirmed). Ignore.
         return;
     }
 
     if (msg_type == MSG_DAG_PUSH_CONFIRMED) {
-        // Leader receives confirmed push from follower: [seq:8][serialized_node]
         if (!data || len <= 8) return;
-
-        // Only the leader should accept confirmed pushes.
-        // If we lost leadership, reject — the follower will timeout
-        // and retry to the new leader.
         if (!raft_is_leader(h->raft)) return;
 
         uint64_t seq;
         memcpy(&seq, data, 8);
 
-        // Deserialize node into our DAG
         size_t consumed = 0;
-        dag_node_deserialize(h->dag, data + 8, len - 8, &consumed);
+        dag_node_t *node = dag_node_deserialize(h->dag, data + 8, len - 8, &consumed);
+        if (node && node->leader_seq == 0) {
+            uint64_t term = raft_get_term(h->raft);
+            node->leader_seq = (term << 32) | (++h->leader_seq_counter);
+            key_index_update(h->dag, node);
+        }
 
-        // Send ACK back to the follower
         network_send_raft(h->net, from_peer, MSG_DAG_PUSH_ACK,
                           (const uint8_t *)&seq, 8);
         return;
     }
 
     if (msg_type == MSG_DAG_PUSH_ACK) {
-        // Follower receives ACK from leader: [seq:8]
         if (!data || len < 8) return;
 
         uint64_t seq;
@@ -1041,19 +1314,17 @@ void handler_on_gossip(handler_t *h, int from_peer, uint8_t msg_type,
 
         pending_push_t *pp = push_find(h, seq);
         if (pp && pp->conn) {
-            // NOW we can ACK the client
             int n = protocol_fmt_ok(h->resp_buf, RESPONSE_BUF_SIZE);
             if (n > 0) conn_send(pp->conn, h->resp_buf, (size_t)n);
             h->stats.requests_ok++;
             push_remove(pp);
         } else if (pp) {
-            // Connection gone (client disconnected), just clean up
             push_remove(pp);
         }
         return;
     }
 
-    // Anti-entropy protocol messages (30-34)
+    // Anti-entropy (30-34)
     gossip_recv(h->gossip, from_peer, msg_type, data, len,
                 gossip_send_cb, h);
 }
@@ -1065,14 +1336,12 @@ void handler_on_gossip(handler_t *h, int from_peer, uint8_t msg_type,
 void handler_on_commit(handler_t *h, uint64_t index, uint64_t term) {
     (void)term;
     if (!h) return;
-
-    // Complete any pending entries (batch proposals)
     pending_complete(h->pending, index);
 }
 
 void handler_on_apply(handler_t *h, uint64_t last_applied) {
     if (!h) return;
-    alr_notify(h->alr, last_applied);
+    (void)last_applied;
 }
 
 void handler_on_leadership_change(handler_t *h, bool is_leader) {
@@ -1080,9 +1349,7 @@ void handler_on_leadership_change(handler_t *h, bool is_leader) {
 
     if (!is_leader) {
         pending_fail_all(h->pending, LYGUS_ERR_NOT_LEADER);
-        alr_on_term_change(h->alr, raft_get_term(h->raft));
 
-        // Fail all pending pushes — leader changed, ACKs won't come
         for (int i = 0; i < MAX_PENDING_PUSHES; i++) {
             pending_push_t *pp = &h->pushes[i];
             if (!pp->active) continue;
@@ -1094,12 +1361,34 @@ void handler_on_leadership_change(handler_t *h, bool is_leader) {
             }
             push_remove(pp);
         }
+
+        frontier_fail_all(h, "leader changed");
+
+        // Abort any in-progress sync
+        if (h->sync_active) {
+            sync_abort(h);
+        }
+        h->leader_ready = false;
+    }
+
+    if (is_leader) {
+        // Don't set leader_seq_counter here — sync_complete will
+        // reconstruct it from max existing leader_seq.
+        // Don't set leader_ready here — sync_complete will.
+        sync_start(h);
     }
 }
 
 void handler_on_term_change(handler_t *h, uint64_t new_term) {
     if (!h) return;
-    alr_on_term_change(h->alr, new_term);
+    // Term changed — any in-flight quorum ping is stale
+    if (h->qping_active && new_term != h->qping_term) {
+        frontier_fail_all(h, "term changed during read");
+    }
+    // Term changed — any in-flight sync is stale
+    if (h->sync_active && new_term != h->sync_term) {
+        sync_abort(h);
+    }
 }
 
 void handler_on_log_truncate(handler_t *h, uint64_t from_index) {
@@ -1110,12 +1399,18 @@ void handler_on_log_truncate(handler_t *h, uint64_t from_index) {
 void handler_on_conn_close(handler_t *h, conn_t *conn) {
     if (!h || !conn) return;
     pending_fail_conn(h->pending, conn, LYGUS_ERR_NET);
-    alr_cancel_conn(h->alr, conn);
 
-    // Null out connection in any pending pushes (don't remove — ACK may still come)
+    // Null out connection in pending pushes
     for (int i = 0; i < MAX_PENDING_PUSHES; i++) {
         if (h->pushes[i].active && h->pushes[i].conn == conn) {
             h->pushes[i].conn = NULL;
+        }
+    }
+
+    // Null out connection in pending frontier reads
+    for (int i = 0; i < MAX_PENDING_FRONTIER_READS; i++) {
+        if (h->frontier_reads[i].active && h->frontier_reads[i].conn == conn) {
+            h->frontier_reads[i].conn = NULL;
         }
     }
 }
@@ -1124,15 +1419,11 @@ void handler_tick(handler_t *h, uint64_t now_ms) {
     if (!h) return;
 
     pending_timeout_sweep(h->pending, now_ms);
-    alr_timeout_sweep(h->alr, now_ms);
 
     // Sweep pending pushes for timeouts
     for (int i = 0; i < MAX_PENDING_PUSHES; i++) {
         pending_push_t *pp = &h->pushes[i];
-        if (!pp->active) continue;
-        if (now_ms < pp->deadline_ms) continue;
-
-        // Timed out — fail the client
+        if (!pp->active || now_ms < pp->deadline_ms) continue;
         if (pp->conn) {
             int n = protocol_fmt_error(h->resp_buf, RESPONSE_BUF_SIZE,
                                        "write timeout (leader ack)");
@@ -1142,14 +1433,47 @@ void handler_tick(handler_t *h, uint64_t now_ms) {
         push_remove(pp);
     }
 
+    // Sweep pending frontier reads for timeouts
+    for (int i = 0; i < MAX_PENDING_FRONTIER_READS; i++) {
+        pending_frontier_read_t *r = &h->frontier_reads[i];
+        if (!r->active || now_ms < r->deadline_ms) continue;
+        if (r->conn) {
+            int n = protocol_fmt_error(h->resp_buf, RESPONSE_BUF_SIZE,
+                                       "read timeout (quorum ping)");
+            if (n > 0) conn_send(r->conn, h->resp_buf, (size_t)n);
+            h->stats.requests_error++;
+        }
+        r->active = false;
+        r->conn = NULL;
+    }
+
+    // Reset stale quorum ping if it timed out
+    if (h->qping_active && now_ms >= h->qping_deadline_ms) {
+        frontier_fail_all(h, "quorum ping timeout");
+    }
+
+    // Reset stale DAG sync if it timed out
+    if (h->sync_active && now_ms >= h->sync_deadline_ms) {
+        sync_abort(h);
+        // leader_ready stays false — reads blocked until next election
+    }
+
     gossip_tick(h->gossip, gossip_send_cb, h);
 
+    // Background drain (GC) — one batch per interval, not on any hot path
+    h->drain_tick_count++;
+    if (h->drain_tick_count >= DRAIN_INTERVAL_TICKS) {
+        h->drain_tick_count = 0;
+        if (raft_is_leader(h->raft) && dag_count(h->dag) > 0
+            && !h->sync_active) {
+            propose_dag_batch(h);
+        }
+    }
 }
 
 void handler_on_readindex_complete(handler_t *h, uint64_t req_id,
                                     uint64_t read_index, int err) {
-    if (!h || !h->alr) return;
-    alr_on_read_index(h->alr, req_id, read_index, err);
+    (void)h; (void)req_id; (void)read_index; (void)err;
 }
 
 void handler_reset_dag(handler_t *h) {
@@ -1165,23 +1489,8 @@ merkle_dag_t *handler_get_dag(const handler_t *h) {
     return h ? h->dag : NULL;
 }
 
-/**
- * Flush pending DAG nodes to Raft if this node is leader.
- *
- * Called when a ReadIndex arrives from a follower — this counts as
- * an "observation" in the Hollow Purple model.  Without this, follower
- * reads would never trigger the leader to commit pending DAG nodes,
- * since ReadIndex is processed entirely in the Raft layer and never
- * flows through handle_get.
- */
 void handler_flush_dag(handler_t *h) {
-    if (!h) return;
-    if (raft_is_leader(h->raft)) {
-        while (dag_count(h->dag) > 0) {
-            uint64_t idx = propose_dag_batch(h);
-            if (idx == 0) break;
-        }
-    }
+    (void)h;
 }
 
 // ============================================================================
@@ -1190,14 +1499,16 @@ void handler_flush_dag(handler_t *h) {
 
 void handler_get_stats(const handler_t *h, handler_stats_t *out) {
     if (!h || !out) return;
-
     *out = h->stats;
     out->writes_pending = pending_count(h->pending);
     out->dag_node_count = dag_count(h->dag);
 
-    alr_stats_t alr_stats;
-    alr_get_stats(h->alr, &alr_stats);
-    out->reads_pending = alr_stats.pending_count;
+    // Count pending frontier reads
+    uint64_t rp = 0;
+    for (int i = 0; i < MAX_PENDING_FRONTIER_READS; i++) {
+        if (h->frontier_reads[i].active) rp++;
+    }
+    out->reads_pending = rp;
 }
 
 size_t handler_pending_count(const handler_t *h) {
