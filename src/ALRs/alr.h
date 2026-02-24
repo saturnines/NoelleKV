@@ -1,9 +1,27 @@
 /**
- * alr.h - Almost Local Reads (Lazy-ALR for Raft)
+ * alr.h - Frontier Follower Reads (Lazy-ALR via Ack Stream)
  *
- * Implements linearizable reads from any replica using the Lazy-ALR
- * technique from "The LAW Theorem" paper.
- * You must call alr_on_read_index() when ReadIndex responses arrive.
+ * Implements linearizable reads from follower replicas using the
+ * Lazy-ALR technique adapted for the frontier protocol.
+ *
+ * Sync mechanism:
+ *   - Follower sends SYNC_REQ to leader
+ *   - Leader responds with max_acked_seq (linearization point)
+ *   - Follower waits for contiguous prefix >= max_acked_seq
+ *   - Follower serves all reads in the batch
+ *
+ * Under write load, SYNC_REQ piggybacks on MSG_DAG_PUSH_FF_ACK
+ * and the response piggybacks on MSG_DAG_PUSH — zero additional
+ * messages.  Under quiet load, one explicit RTT.
+ *
+ * State machine (maps 1:1 to TLA+ spec):
+ *   followerPendingReads  →  reads waiting for next sync
+ *   followerSyncBatch     →  reads in current sync (closed)
+ *   followerSyncTarget    →  max_acked_seq from leader, 0 = inactive
+ *
+ * CRITICAL: reads arriving after sync is sent go into pendingReads
+ * (next batch), NOT syncBatch (current batch).  Mixing them breaks
+ * linearizability — see §5A and TLA+ FollowerSendSync comments.
  */
 
 #ifndef ALR_H
@@ -13,171 +31,152 @@
 #include <stddef.h>
 #include <stdbool.h>
 
-#include "raft.h"
 #include "public/lygus_errors.h"
 
-// Forward declarations
 typedef struct alr alr_t;
-typedef struct lygus_kv lygus_kv_t;
 
 // ============================================================================
 // Stats
 // ============================================================================
 
 typedef struct {
-    uint64_t reads_total;       // Total reads queued
-    uint64_t reads_completed;   // Successfully completed
-    uint64_t reads_stale;       // Failed due to stale sync
-    uint64_t reads_failed;      // Failed for other reasons
-    uint64_t reads_timeout;     // Failed due to timeout
+    uint64_t reads_total;
+    uint64_t reads_completed;
+    uint64_t reads_failed;
+    uint64_t reads_timeout;
+    uint64_t syncs_sent;          // SYNC_REQ messages sent
+    uint64_t syncs_piggybacked;   // Syncs piggybacked on ff-ack
+    uint64_t batched;             // Reads batched onto existing sync
 
-    uint64_t syncs_issued;      // NOOPs proposed (leader)
-    uint64_t read_index_issued; // ReadIndex requests sent (follower)
-    uint64_t piggybacks;        // Syncs piggybacked on writes
-    uint64_t batched;           // Reads batched onto existing sync
-
-    // Current state
-    uint16_t pending_count;     // Reads currently queued
-    size_t   slab_used;         // Current slab usage
-    size_t   slab_high_water;   // Peak slab usage
-    bool     pending_read_index; // ReadIndex request in flight
+    uint16_t pending_count;       // Reads in pending queue
+    uint16_t batch_count;         // Reads in active sync batch
+    uint64_t contiguous_prefix;   // Current prefix watermark
 } alr_stats_t;
 
 // ============================================================================
-// Callbacks
+// Callback
 // ============================================================================
 
 /**
- * Response callback - called when a read completes or fails.
+ * Called when a batch of reads is ready to serve, or when reads fail.
  *
- * @param conn   Connection handle (from alr_read)
- * @param key    Key that was read
- * @param klen   Key length
- * @param val    Value (NULL on error or not found)
- * @param vlen   Value length
- * @param err    Error code (LYGUS_OK on success)
- * @param ctx    User context
+ * For success: handler.c does the DAG lookup + response, filtering
+ *   to writes with leader_seq <= sync_target.
+ * For failure: handler.c sends error to client.
+ *
+ * @param conn         Client connection
+ * @param key          Key to read
+ * @param klen         Key length
+ * @param sync_target  leader's max_acked_seq (0 on error or empty)
+ * @param err          LYGUS_OK = serve from DAG, anything else = fail
+ * @param ctx          User context (handler_t*)
  */
-typedef void (*alr_respond_fn)(void *conn, const void *key, size_t klen,
-                                const void *val, size_t vlen,
-                                lygus_err_t err, void *ctx);
+typedef void (*alr_serve_fn)(void *conn, const void *key, size_t klen,
+                              uint64_t sync_target, lygus_err_t err,
+                              void *ctx);
 
 // ============================================================================
 // Configuration
 // ============================================================================
 
 typedef struct {
-    raft_t         *raft;        // Required: Raft instance
-    lygus_kv_t     *kv;          // Required: KV store
-    alr_respond_fn  respond;     // Required: Response callback
-    void           *respond_ctx; // Optional: Callback context
+    alr_serve_fn  serve;          // Required: serve/fail callback
+    void         *serve_ctx;      // Optional: callback context
 
-    uint16_t capacity;           // Max pending reads (default: 4096)
-    size_t   slab_size;          // Key slab size (default: 16MB)
-    uint32_t timeout_ms;         // Read timeout in ms (default: 5000)
+    uint16_t capacity;            // Max pending reads (default: 4096)
+    size_t   slab_size;           // Key slab size (default: 16MB)
+    uint32_t timeout_ms;          // Read timeout in ms (default: 5000)
 } alr_config_t;
 
 // ============================================================================
 // Lifecycle
 // ============================================================================
 
-/**
- * Create an ALR instance.
- */
 alr_t *alr_create(const alr_config_t *cfg);
-
-/**
- * Destroy an ALR instance.
- * Any pending reads will NOT receive callbacks.
- */
-void alr_destroy(alr_t *alr);
+void   alr_destroy(alr_t *alr);
 
 // ============================================================================
-// Core Operations
+// Core Operations (called by handler.c)
 // ============================================================================
 
 /**
- * Queue a read request.
+ * Queue a follower read.
  *
- * The read will be executed once a sync point is established and applied.
- * Response delivered via the respond callback.
+ * If no sync is in flight, the read goes into pending (next batch).
+ * handler.c is responsible for calling alr_send_sync() afterward.
  *
- * @param alr     ALR instance
- * @param key     Key to read
- * @param klen    Key length
- * @param conn    Connection handle (passed to callback)
- * @param now_ms  Current monotonic time in milliseconds
- *
- * @return LYGUS_OK           - Read queued successfully
- *         LYGUS_ERR_BATCH_FULL - Buffer full, retry later
- *         LYGUS_ERR_TRY_LEADER - Follower can't serve, redirect to leader
- *         LYGUS_ERR_SYNC_FAILED - Failed to establish sync point
+ * @return LYGUS_OK or LYGUS_ERR_BATCH_FULL
  */
-lygus_err_t alr_read(alr_t *alr, const void *key, size_t klen, void *conn, uint64_t now_ms);
+lygus_err_t alr_read(alr_t *alr, const void *key, size_t klen,
+                      void *conn, uint64_t now_ms);
 
 /**
- * Notify ALR that entries have been applied to the state machine.
+ * Close the pending batch and mark sync as in-flight.
  *
- * Call this from your Raft apply callback. This triggers completion
- * of reads whose sync point has been reached.
+ * Moves all pending reads → sync batch.  Returns true if there
+ * are reads to sync (caller should send MSG_FOLLOWER_SYNC_REQ).
+ * Returns false if no pending reads or a sync is already active.
  *
- * @param alr           ALR instance
- * @param applied_index Highest applied log index
+ * Maps to TLA+ FollowerSendSync.
  */
-void alr_notify(alr_t *alr, uint64_t applied_index);
+bool alr_send_sync(alr_t *alr);
 
 /**
- * Handle ReadIndex response from leader.
+ * Leader responded with max_acked_seq.
  *
- * Call this when the Raft layer receives a ReadIndex response.
+ * If max_seq == 0: serve batch immediately (empty visible set).
+ * If max_seq >  0: set target, wait for prefix gate.
  *
- * @param alr     ALR instance
- * @param req_id  Request ID (from raft_request_read_index_async)
- * @param index   Read index returned by leader (ignored if err != 0)
- * @param err     0 on success, non-zero on failure
+ * Maps to TLA+ FollowerReceiveSync.
  */
-void alr_on_read_index(alr_t *alr, uint64_t req_id, uint64_t index, int err);
+void alr_recv_sync(alr_t *alr, uint64_t max_seq);
 
 /**
- * Notify ALR of a term change.
+ * Notify that a DAG node with this leader_seq arrived (ff-push).
  *
- * Call this when the Raft term changes. Invalidates pending syncs
- * and fails reads waiting on ReadIndex.
+ * Updates the contiguous prefix tracker.  If the prefix gate
+ * is now satisfied, serves the batch.
  *
- * @param alr       ALR instance
- * @param new_term  The new term
+ * Called from handler.c on every ff-push delivery that has a
+ * nonzero leader_seq.
  */
-void alr_on_term_change(alr_t *alr, uint64_t new_term);
+void alr_notify_seq(alr_t *alr, uint64_t seq);
 
 /**
- * Cancel all pending reads for a connection.
+ * Sync failed (leader unreachable, term change, etc).
+ * Fails all reads in both pending and batch queues.
  *
- * Call this when a client disconnects. Callbacks will be invoked
- * with LYGUS_ERR_NET.
- *
- * @param alr   ALR instance
- * @param conn  Connection handle
- *
- * @return Number of reads cancelled
+ * Maps to TLA+ FollowerSyncTimeout + election cleanup.
+ */
+void alr_flush(alr_t *alr, lygus_err_t err);
+
+/**
+ * Cancel all reads for a disconnected client.
  */
 int alr_cancel_conn(alr_t *alr, void *conn);
 
 /**
  * Sweep for timed-out reads.
- *
- * Call this periodically (e.g., from tick handler). Fails reads
- * that have exceeded their deadline.
- *
- * @param alr     ALR instance
- * @param now_ms  Current monotonic time in milliseconds
- *
- * @return Number of reads timed out
  */
 int alr_timeout_sweep(alr_t *alr, uint64_t now_ms);
 
 /**
- * Get statistics.
+ * Is a sync currently in flight?
+ * handler.c uses this to decide whether to piggyback on ff-ack.
  */
+bool alr_sync_active(const alr_t *alr);
+
+/**
+ * Are there pending reads waiting for a sync?
+ * handler.c uses this to decide whether to send SYNC_REQ.
+ */
+bool alr_has_pending(const alr_t *alr);
+
+/**
+ * Get the current contiguous prefix (for debugging/stats).
+ */
+uint64_t alr_get_prefix(const alr_t *alr);
+
 void alr_get_stats(const alr_t *alr, alr_stats_t *out);
 
 #endif // ALR_H

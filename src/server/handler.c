@@ -24,6 +24,7 @@
 #include "handler.h"
 #include "pending.h"
 #include "protocol.h"
+#include "../ALRs/alr.h"
 
 // External dependencies
 #include "raft.h"
@@ -121,6 +122,9 @@ struct handler {
     gossip_t        *gossip;
     merkle_dag_t    *apply_dag;
 
+    // Follower reads (owned)
+    alr_t           *alr;
+
     // Config
     int              node_id;
     int              num_peers;
@@ -196,6 +200,15 @@ static void sync_handle_response(handler_t *h, int from_peer,
 static void sync_complete(handler_t *h);
 static bool sync_peer_has_hash(handler_t *h, const uint8_t *hash);
 static void sync_add_peer_hash(handler_t *h, const uint8_t *hash);
+
+// Follower read (Lazy-ALR) serve callback
+static void alr_serve_cb(void *conn, const void *key, size_t klen,
+                          uint64_t sync_target, lygus_err_t err, void *ctx);
+
+// Follower read: filtered DAG lookup (leader_seq <= target)
+static dag_node_t *find_latest_up_to(handler_t *h,
+                                      const uint8_t *key, size_t key_len,
+                                      uint64_t max_seq);
 
 // ============================================================================
 // Confirmed Push Helpers
@@ -392,6 +405,107 @@ static void frontier_fail_all(handler_t *h, const char *reason) {
 // ============================================================================
 // DAG Sync on Election (§6.2)
 // ============================================================================
+
+/**
+ * Compute max_acked_seq: highest leader_seq among writes that are
+ * ordered AND not pending bilateral confirmation.
+ *
+ * This is the linearization point for follower reads.
+ * Maps to TLA+ MaxWriteOrder(safeWrites) in LeaderProcessSync.
+ */
+static uint64_t leader_max_acked_seq(handler_t *h) {
+    uint64_t max_seq = 0;
+    dag_node_t *node, *tmp;
+    HASH_ITER(hh, h->dag->nodes, node, tmp) {
+        if (node->leader_seq == 0) continue;
+        if (is_pending_leader_write(h, node->hash)) continue;
+        if (node->leader_seq > max_seq) max_seq = node->leader_seq;
+    }
+    return max_seq;
+}
+
+/**
+ * Find the latest DAG node for a key with leader_seq <= max_seq,
+ * skipping unconfirmed leader writes.
+ *
+ * Used by follower reads: the follower must only see writes up to
+ * the sync target (TLA+ FollowerServeReads visibleWrites filter).
+ */
+static dag_node_t *find_latest_up_to(handler_t *h,
+                                      const uint8_t *key, size_t key_len,
+                                      uint64_t max_seq) {
+    dag_node_t *best = NULL;
+    dag_node_t *node, *tmp;
+    HASH_ITER(hh, h->dag->nodes, node, tmp) {
+        if (node->key_len != key_len) continue;
+        if (memcmp(node->key, key, key_len) != 0) continue;
+        if (node->leader_seq == 0) continue;
+        if (node->leader_seq > max_seq) continue;
+        if (is_pending_leader_write(h, node->hash)) continue;
+        if (!best || dag_node_wins(node, best)) {
+            best = node;
+        }
+    }
+    return best;
+}
+
+/**
+ * ALR serve callback — called when a follower read batch is ready.
+ *
+ * On success (err == LYGUS_OK): do the DAG lookup filtered to
+ *   leader_seq <= sync_target, then respond to client.
+ * On error: send error to client.
+ */
+static void alr_serve_cb(void *conn, const void *key, size_t klen,
+                          uint64_t sync_target, lygus_err_t err, void *ctx) {
+    handler_t *h = (handler_t *)ctx;
+    if (!conn) return;
+
+    if (err != LYGUS_OK) {
+        const char *msg;
+        switch (err) {
+            case LYGUS_ERR_STALE_READ: msg = "stale read (term changed)"; break;
+            case LYGUS_ERR_NOT_LEADER: msg = "leader changed, retry"; break;
+            case LYGUS_ERR_TIMEOUT:    msg = "read timeout (follower sync)"; break;
+            default:                   msg = "follower read failed"; break;
+        }
+        int n = protocol_fmt_error(h->resp_buf, RESPONSE_BUF_SIZE, msg);
+        if (n > 0) conn_send((conn_t *)conn, h->resp_buf, (size_t)n);
+        h->stats.requests_error++;
+        return;
+    }
+
+    // Serve from DAG, filtered to leader_seq <= sync_target
+    dag_node_t *node = NULL;
+    if (sync_target > 0) {
+        node = find_latest_up_to(h, (const uint8_t *)key, klen, sync_target);
+    }
+
+    int n;
+    if (node) {
+        if (node->value[0] == DAG_OP_DEL) {
+            n = protocol_fmt_not_found(h->resp_buf, RESPONSE_BUF_SIZE);
+        } else if (node->value[0] == DAG_OP_PUT && node->value_len > 1) {
+            n = protocol_fmt_value(h->resp_buf, RESPONSE_BUF_SIZE,
+                                   node->value + 1, node->value_len - 1);
+        } else {
+            n = protocol_fmt_not_found(h->resp_buf, RESPONSE_BUF_SIZE);
+        }
+    } else {
+        // Nothing in DAG up to target — fall back to KV (drained values)
+        uint8_t val_buf[DEFAULT_MAX_VALUE];
+        size_t vlen = lygus_kv_get(h->kv, (const uint8_t *)key, klen,
+                                    val_buf, sizeof(val_buf));
+        if (vlen > 0 && vlen < sizeof(val_buf)) {
+            n = protocol_fmt_value(h->resp_buf, RESPONSE_BUF_SIZE, val_buf, vlen);
+        } else {
+            n = protocol_fmt_not_found(h->resp_buf, RESPONSE_BUF_SIZE);
+        }
+    }
+
+    if (n > 0) conn_send((conn_t *)conn, h->resp_buf, (size_t)n);
+    h->stats.requests_ok++;
+}
 
 /**
  * Track a hash as peer-confirmed (for Bug 3 guard).
@@ -619,6 +733,16 @@ handler_t *handler_create(const handler_config_t *cfg) {
     h->gossip = gossip_create(&gossip_cfg);
     if (!h->gossip) goto fail;
 
+    // Follower reads (Lazy-ALR)
+    alr_config_t alr_cfg = {
+        .serve     = alr_serve_cb,
+        .serve_ctx = h,
+        .capacity  = MAX_PENDING_FRONTIER_READS,
+        .timeout_ms = cfg->request_timeout_ms > 0 ? cfg->request_timeout_ms : DEFAULT_TIMEOUT_MS,
+    };
+    h->alr = alr_create(&alr_cfg);
+    if (!h->alr) goto fail;
+
     h->resp_buf = malloc(RESPONSE_BUF_SIZE);
     h->entry_buf = malloc(ENTRY_BUF_SIZE);
     h->batch_buf_cap = cfg->batch_buf_size > 0 ? cfg->batch_buf_size : DEFAULT_BATCH_BUF_SIZE;
@@ -661,6 +785,7 @@ void handler_destroy(handler_t *h) {
 
     if (h->proto) protocol_ctx_destroy(h->proto);
     if (h->gossip) gossip_destroy(h->gossip);
+    if (h->alr) alr_destroy(h->alr);
     if (h->dag) dag_destroy(h->dag);
     if (h->apply_dag) dag_destroy(h->apply_dag);
 
@@ -951,73 +1076,92 @@ static void handle_status(handler_t *h, conn_t *conn) {
 /**
  * GET handler — FRONTIER read path.
  *
- * 1. Verify leadership (redirect if not leader)
- * 2. Stash conn + key in pending frontier reads
- * 3. If no quorum ping in flight → start one
- * 4. On majority ACK → frontier_serve_all (see handler_on_gossip)
+ * Leader path (quorum ping):
+ *   1. Stash conn + key in pending frontier reads
+ *   2. If no quorum ping in flight → start one
+ *   3. On majority ACK → frontier_serve_all
+ *
+ * Follower path (Lazy-ALR):
+ *   1. Queue read in ALR (pending batch)
+ *   2. If no sync in flight → close batch, send SYNC_REQ
+ *   3. Leader responds with max_acked_seq
+ *   4. Prefix gate clears → serve batch
  */
 static void handle_get(handler_t *h, conn_t *conn, const request_t *req) {
     h->stats.reads_total++;
 
-    // Frontier: all reads go through leader
-    if (!raft_is_leader(h->raft)) {
-        int leader = raft_get_leader_id(h->raft);
-        int n;
-        if (leader >= 0) {
-            n = protocol_fmt_errorf(h->resp_buf, RESPONSE_BUF_SIZE,
-                                    "not leader, try node %d", leader);
-        } else {
-            n = protocol_fmt_error(h->resp_buf, RESPONSE_BUF_SIZE,
-                                   "not leader, leader unknown");
+    if (raft_is_leader(h->raft)) {
+        // ---- Leader read path (unchanged) ----
+
+        // Block reads until DAG sync completes (§6.2 leaderReady gate)
+        if (!h->leader_ready) {
+            int n = protocol_fmt_error(h->resp_buf, RESPONSE_BUF_SIZE,
+                                       "leader syncing, retry");
+            if (n > 0) conn_send(conn, h->resp_buf, (size_t)n);
+            h->stats.requests_error++;
+            return;
         }
-        if (n > 0) conn_send(conn, h->resp_buf, (size_t)n);
-        h->stats.requests_error++;
-        return;
-    }
 
-    // Block reads until DAG sync completes (§6.2 leaderReady gate)
-    if (!h->leader_ready) {
-        int n = protocol_fmt_error(h->resp_buf, RESPONSE_BUF_SIZE,
-                                   "leader syncing, retry");
-        if (n > 0) conn_send(conn, h->resp_buf, (size_t)n);
-        h->stats.requests_error++;
-        return;
-    }
+        if (req->klen > FRONTIER_MAX_KEY_SIZE) {
+            int n = protocol_fmt_error(h->resp_buf, RESPONSE_BUF_SIZE,
+                                       "key too large");
+            if (n > 0) conn_send(conn, h->resp_buf, (size_t)n);
+            h->stats.requests_error++;
+            return;
+        }
 
-    // Bounds check
-    if (req->klen > FRONTIER_MAX_KEY_SIZE) {
-        int n = protocol_fmt_error(h->resp_buf, RESPONSE_BUF_SIZE,
-                                   "key too large");
-        if (n > 0) conn_send(conn, h->resp_buf, (size_t)n);
-        h->stats.requests_error++;
-        return;
-    }
+        pending_frontier_read_t *r = frontier_alloc(h);
+        if (!r) {
+            int n = protocol_fmt_error(h->resp_buf, RESPONSE_BUF_SIZE,
+                                       "read queue full");
+            if (n > 0) conn_send(conn, h->resp_buf, (size_t)n);
+            h->stats.requests_error++;
+            return;
+        }
 
-    // Stash the read
-    pending_frontier_read_t *r = frontier_alloc(h);
-    if (!r) {
-        int n = protocol_fmt_error(h->resp_buf, RESPONSE_BUF_SIZE,
-                                   "read queue full");
-        if (n > 0) conn_send(conn, h->resp_buf, (size_t)n);
-        h->stats.requests_error++;
-        return;
-    }
+        r->conn = conn;
+        memcpy(r->key, req->key, req->klen);
+        r->key_len = req->klen;
+        r->deadline_ms = event_loop_now_ms(h->loop) + h->timeout_ms;
+        r->active = true;
 
-    r->conn = conn;
-    memcpy(r->key, req->key, req->klen);
-    r->key_len = req->klen;
-    r->deadline_ms = event_loop_now_ms(h->loop) + h->timeout_ms;
-    r->active = true;
+        if (!h->qping_active) {
+            frontier_start_qping(h);
+        }
 
-    // Start quorum ping if not already in flight
-    if (!h->qping_active) {
-        frontier_start_qping(h);
-    }
+        int majority = (h->num_peers / 2) + 1;
+        if (h->qping_acks >= majority) {
+            frontier_serve_all(h);
+        }
+    } else {
+        // ---- Follower read path (Lazy-ALR) ----
 
-    // Single-node cluster: self is majority, serve immediately
-    int majority = (h->num_peers / 2) + 1;
-    if (h->qping_acks >= majority) {
-        frontier_serve_all(h);
+        // Need a known leader to sync with
+        int leader = raft_get_leader_id(h->raft);
+        if (leader < 0) {
+            int n = protocol_fmt_error(h->resp_buf, RESPONSE_BUF_SIZE,
+                                       "leader unknown, retry");
+            if (n > 0) conn_send(conn, h->resp_buf, (size_t)n);
+            h->stats.requests_error++;
+            return;
+        }
+
+        uint64_t now = event_loop_now_ms(h->loop);
+        lygus_err_t err = alr_read(h->alr, req->key, req->klen, conn, now);
+        if (err != LYGUS_OK) {
+            int n = protocol_fmt_error(h->resp_buf, RESPONSE_BUF_SIZE,
+                                       "follower read queue full");
+            if (n > 0) conn_send(conn, h->resp_buf, (size_t)n);
+            h->stats.requests_error++;
+            return;
+        }
+
+        // If no sync is in flight, close the batch and send SYNC_REQ
+        if (alr_send_sync(h->alr)) {
+            uint64_t term = raft_get_term(h->raft);
+            network_send_raft(h->net, leader, MSG_FOLLOWER_SYNC_REQ,
+                              (const uint8_t *)&term, 8);
+        }
     }
 }
 
@@ -1258,6 +1402,43 @@ void handler_on_gossip(handler_t *h, int from_peer, uint8_t msg_type,
         return;
     }
 
+    // ---- Follower read sync (Lazy-ALR) ----
+
+    if (msg_type == MSG_FOLLOWER_SYNC_REQ) {
+        // Follower wants max_acked_seq.  Only respond if we're the
+        // ready leader at the requested term.
+        if (!data || len < 8) return;
+        if (!raft_is_leader(h->raft)) return;
+        if (!h->leader_ready) return;
+
+        uint64_t req_term;
+        memcpy(&req_term, data, 8);
+
+        uint64_t my_term = raft_get_term(h->raft);
+        if (req_term != my_term) return;
+
+        // Snapshot max_acked_seq at THIS instant — the linearization point.
+        // Maps to TLA+ LeaderProcessSync.
+        uint64_t max_seq = leader_max_acked_seq(h);
+
+        network_send_raft(h->net, from_peer, MSG_FOLLOWER_SYNC_RESP,
+                          (const uint8_t *)&max_seq, 8);
+        return;
+    }
+
+    if (msg_type == MSG_FOLLOWER_SYNC_RESP) {
+        // Leader responded with max_acked_seq.
+        // Forward to ALR which handles the prefix gate.
+        if (!data || len < 8) return;
+        if (raft_is_leader(h->raft)) return;  // leaders don't do ALR
+
+        uint64_t max_seq;
+        memcpy(&max_seq, data, 8);
+
+        alr_recv_sync(h->alr, max_seq);
+        return;
+    }
+
     // ---- Write path messages ----
 
     if (msg_type == MSG_DAG_PUSH) {
@@ -1267,6 +1448,10 @@ void handler_on_gossip(handler_t *h, int from_peer, uint8_t msg_type,
             if (node) {
                 network_send_raft(h->net, from_peer, MSG_DAG_PUSH_FF_ACK,
                                   node->hash, DAG_HASH_SIZE);
+                // Notify ALR prefix tracker (follower reads)
+                if (node->leader_seq > 0) {
+                    alr_notify_seq(h->alr, node->leader_seq);
+                }
             }
         }
         return;
@@ -1364,6 +1549,9 @@ void handler_on_leadership_change(handler_t *h, bool is_leader) {
 
         frontier_fail_all(h, "leader changed");
 
+        // Flush follower read state
+        alr_flush(h->alr, LYGUS_ERR_NOT_LEADER);
+
         // Abort any in-progress sync
         if (h->sync_active) {
             sync_abort(h);
@@ -1389,6 +1577,8 @@ void handler_on_term_change(handler_t *h, uint64_t new_term) {
     if (h->sync_active && new_term != h->sync_term) {
         sync_abort(h);
     }
+    // Term changed — flush follower reads
+    alr_flush(h->alr, LYGUS_ERR_STALE_READ);
 }
 
 void handler_on_log_truncate(handler_t *h, uint64_t from_index) {
@@ -1413,6 +1603,9 @@ void handler_on_conn_close(handler_t *h, conn_t *conn) {
             h->frontier_reads[i].conn = NULL;
         }
     }
+
+    // Cancel follower reads for this connection
+    alr_cancel_conn(h->alr, conn);
 }
 
 void handler_tick(handler_t *h, uint64_t now_ms) {
@@ -1459,6 +1652,24 @@ void handler_tick(handler_t *h, uint64_t now_ms) {
     }
 
     gossip_tick(h->gossip, gossip_send_cb, h);
+
+    // Follower reads: timeout sweep + quiet-path sync
+    alr_timeout_sweep(h->alr, now_ms);
+    if (!raft_is_leader(h->raft) && alr_has_pending(h->alr)) {
+        // Quiet path: reads arrived but no ff-ack flowing to piggyback on.
+        // Close the batch and send an explicit SYNC_REQ.
+        if (alr_send_sync(h->alr)) {
+            int leader = raft_get_leader_id(h->raft);
+            if (leader >= 0) {
+                uint64_t term = raft_get_term(h->raft);
+                network_send_raft(h->net, leader, MSG_FOLLOWER_SYNC_REQ,
+                                  (const uint8_t *)&term, 8);
+            } else {
+                // No known leader — fail the batch
+                alr_flush(h->alr, LYGUS_ERR_NOT_LEADER);
+            }
+        }
+    }
 
     // Background drain (GC) — one batch per interval, not on any hot path
     h->drain_tick_count++;

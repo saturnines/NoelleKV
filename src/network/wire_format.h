@@ -49,6 +49,10 @@ extern "C" {
         MSG_DAG_SYNC_REQ        = 41,   // New leader → peers: "send me your DAG" [term:8]
         MSG_DAG_SYNC_RESP       = 42,   // Peer → new leader: [term:8][dag batch...]
 
+        // ---- Follower read path (Lazy-ALR) ----
+        MSG_FOLLOWER_SYNC_REQ   = 43,   // Follower → leader: "max_acked_seq?" [term:8]
+        MSG_FOLLOWER_SYNC_RESP  = 44,   // Leader → follower: [max_acked_seq:8]
+
     } msg_type_t;
 
 /**
@@ -56,7 +60,7 @@ extern "C" {
  * These route to gossip_inbox in the network layer.
  */
 static inline int msg_is_gossip(uint8_t type) {
-    return type >= MSG_GOSSIP_SYNC && type <= MSG_DAG_SYNC_RESP;
+    return type >= MSG_GOSSIP_SYNC && type <= MSG_FOLLOWER_SYNC_RESP;
 }
 
 // ============================================================================
