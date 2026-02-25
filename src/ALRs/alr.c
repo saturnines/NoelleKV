@@ -1,8 +1,6 @@
 /**
  * alr.c - Frontier Follower Reads (Lazy-ALR via Ack Stream)
  *
- * State machine (maps 1:1 to TLA+ MalevolentShrineFrontier spec):
- *
  *   pending[]  = followerPendingReads  — reads waiting for next sync
  *   batch[]    = followerSyncBatch     — reads in current sync (closed)
  *   sync_target = followerSyncTarget   — max_acked_seq, 0 = inactive

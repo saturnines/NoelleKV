@@ -86,6 +86,7 @@ typedef struct {
     uint64_t    deadline_ms;
     bool        active;
     bool        is_leader_write;
+    int         ack_count;          // ff-acks received (N>=5 quorum)
 } pending_push_t;
 
 // ============================================================================
@@ -146,6 +147,7 @@ struct handler {
     // Confirmed push state
     pending_push_t   pushes[MAX_PENDING_PUSHES];
     uint64_t         next_push_seq;
+    int              ack_threshold;  // ff-acks needed: (num_peers/2) for N>=5, 1 for N=3
 
     // Background drain tick counter
     uint64_t         drain_tick_count;
@@ -244,6 +246,7 @@ static void push_remove(pending_push_t *pp) {
     pp->conn = NULL;
     pp->seq = 0;
     pp->is_leader_write = false;
+    pp->ack_count = 0;
     memset(pp->hash, 0, DAG_HASH_SIZE);
 }
 
@@ -700,6 +703,12 @@ handler_t *handler_create(const handler_config_t *cfg) {
     h->net = cfg->net;
     h->node_id = cfg->node_id;
     h->num_peers = cfg->num_peers;
+    // Write quorum: leader + ack_threshold peers must have the write.
+    // N=3: threshold=1 (bilateral, current behavior)
+    // N=5: threshold=2 (leader + 2 peers = majority)
+    // N=7: threshold=3 (leader + 3 peers = majority)
+    // Formula: ceil(N/2) - 1 = (num_peers / 2)  [integer division]
+    h->ack_threshold = cfg->num_peers > 1 ? (cfg->num_peers / 2) : 0;
     h->version = cfg->version ? cfg->version : "unknown";
     h->timeout_ms = cfg->request_timeout_ms > 0 ? cfg->request_timeout_ms : DEFAULT_TIMEOUT_MS;
     h->leader_only = cfg->leader_only_reads;
@@ -1460,12 +1469,15 @@ void handler_on_gossip(handler_t *h, int from_peer, uint8_t msg_type,
     if (msg_type == MSG_DAG_PUSH_FF_ACK) {
         if (!data || len < DAG_HASH_SIZE) return;
         pending_push_t *pp = push_find_by_hash(h, data);
-        if (pp && pp->conn) {
-            int n = protocol_fmt_ok(h->resp_buf, RESPONSE_BUF_SIZE);
-            if (n > 0) conn_send(pp->conn, h->resp_buf, (size_t)n);
-            h->stats.requests_ok++;
-            push_remove(pp);
-        } else if (pp) {
+        if (!pp) return;
+
+        pp->ack_count++;
+        if (pp->ack_count >= h->ack_threshold) {
+            if (pp->conn) {
+                int n = protocol_fmt_ok(h->resp_buf, RESPONSE_BUF_SIZE);
+                if (n > 0) conn_send(pp->conn, h->resp_buf, (size_t)n);
+                h->stats.requests_ok++;
+            }
             push_remove(pp);
         }
         return;
