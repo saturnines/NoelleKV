@@ -234,7 +234,7 @@ static pending_push_t *push_find(handler_t *h, uint64_t seq) {
 
 static pending_push_t *push_find_by_hash(handler_t *h, const uint8_t *hash) {
     for (int i = 0; i < MAX_PENDING_PUSHES; i++) {
-        if (h->pushes[i].active && h->pushes[i].is_leader_write
+        if (h->pushes[i].active
             && memcmp(h->pushes[i].hash, hash, DAG_HASH_SIZE) == 0)
             return &h->pushes[i];
     }
@@ -1047,6 +1047,7 @@ static void push_node_confirmed(handler_t *h, conn_t *conn, dag_node_t *node) {
 
     uint64_t now = event_loop_now_ms(h->loop);
     pp->seq = seq;
+    memcpy(pp->hash, node->hash, DAG_HASH_SIZE);  // N>=5: ff-acks match by hash
     pp->conn = conn;
     pp->deadline_ms = now + h->timeout_ms;
     pp->active = true;
@@ -1510,12 +1511,15 @@ void handler_on_gossip(handler_t *h, int from_peer, uint8_t msg_type,
         memcpy(&seq, data, 8);
 
         pending_push_t *pp = push_find(h, seq);
-        if (pp && pp->conn) {
-            int n = protocol_fmt_ok(h->resp_buf, RESPONSE_BUF_SIZE);
-            if (n > 0) conn_send(pp->conn, h->resp_buf, (size_t)n);
-            h->stats.requests_ok++;
-            push_remove(pp);
-        } else if (pp) {
+        if (!pp) return;
+
+        pp->ack_count++;
+        if (pp->ack_count >= h->ack_threshold) {
+            if (pp->conn) {
+                int n = protocol_fmt_ok(h->resp_buf, RESPONSE_BUF_SIZE);
+                if (n > 0) conn_send(pp->conn, h->resp_buf, (size_t)n);
+                h->stats.requests_ok++;
+            }
             push_remove(pp);
         }
         return;
