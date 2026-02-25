@@ -1,26 +1,3 @@
-/**
- * handler.c - Request handling with PRDT Merkle DAG + Raft integration
- *
- * Write path (leader):
- *   PUT/DEL → dag_add → fire-and-forget push to all peers
- *           → wait for one peer MSG_DAG_PUSH_FF_ACK
- *           → OK to client (bilateral: leader + confirming peer)
- *
- * Write path (follower):
- *   PUT/DEL → dag_add → confirmed push to leader + ff push to others
- *           → wait for leader MSG_DAG_PUSH_ACK
- *           → OK to client (bilateral: follower + leader)
- *
- * Read path (leader — FRONTIER):
- *   GET → send MSG_QUORUM_PING to all peers
- *       → wait for majority MSG_QUORUM_PING_ACK
- *       → dag_get_latest(key) → serve from DAG
- *       → zero Raft, zero drain, zero disk I/O
- *
- * Apply path (background GC only):
- *   Periodic drain → raft_propose batch → commit → apply to KV
- */
-
 #include "handler.h"
 #include "pending.h"
 #include "protocol.h"
@@ -1497,6 +1474,13 @@ void handler_on_gossip(handler_t *h, int from_peer, uint8_t msg_type,
             uint64_t term = raft_get_term(h->raft);
             node->leader_seq = (term << 32) | (++h->leader_seq_counter);
             key_index_update(h->dag, node);
+
+            // Re-push to all peers WITH leader_seq now assigned.
+            // The original ff-push from the follower had leader_seq=0,
+            // so other followers' prefix trackers missed this counter.
+            // Without this, follower reads timeout waiting for a gap
+            // that never fills.
+            push_node_to_peers(h, node);
         }
 
         network_send_raft(h->net, from_peer, MSG_DAG_PUSH_ACK,
