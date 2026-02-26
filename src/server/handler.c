@@ -42,7 +42,7 @@
 
 #define MAX_TIP_PARENTS          8
 #define MAX_PENDING_PUSHES       4096
-#define DRAIN_INTERVAL_TICKS     10
+#define DRAIN_INTERVAL_TICKS     2 // was 10
 
 // Frontier read path
 #define MAX_PENDING_FRONTIER_READS  2048
@@ -892,7 +892,7 @@ static uint64_t propose_dag_batch(handler_t *h) {
 
     h->batch_buf[0] = DAG_ENTRY_MARKER;
     ssize_t bl = dag_serialize_batch_excluding(
-        h->dag, h->batch_buf + 1, h->batch_buf_cap - 1, excl, ec, 200);
+        h->dag, h->batch_buf + 1, h->batch_buf_cap - 1, excl, ec, 1000);
 
     if (bl < 0) { free(excl); return 0; }
 
