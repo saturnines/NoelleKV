@@ -1144,7 +1144,7 @@ static void handle_get(handler_t *h, conn_t *conn, const request_t *req) {
         }
 
         // If no sync is in flight, close the batch and send SYNC_REQ
-        if (alr_send_sync(h->alr)) {
+        if (alr_send_sync(h->alr, now)) {
             uint64_t term = raft_get_term(h->raft);
             network_send_raft(h->net, leader, MSG_FOLLOWER_SYNC_REQ,
                               (const uint8_t *)&term, 8);
@@ -1577,8 +1577,8 @@ void handler_on_term_change(handler_t *h, uint64_t new_term) {
     if (h->sync_active && new_term != h->sync_term) {
         sync_abort(h);
     }
-    // Term changed — flush follower reads
-    alr_flush(h->alr, LYGUS_ERR_STALE_READ);
+    // Term changed — flush follower sync batch (pending reads survive)
+    alr_flush_sync(h->alr, LYGUS_ERR_STALE_READ);
 }
 
 void handler_on_log_truncate(handler_t *h, uint64_t from_index) {
@@ -1658,7 +1658,7 @@ void handler_tick(handler_t *h, uint64_t now_ms) {
     if (!raft_is_leader(h->raft) && alr_has_pending(h->alr)) {
         // Quiet path: reads arrived but no ff-ack flowing to piggyback on.
         // Close the batch and send an explicit SYNC_REQ.
-        if (alr_send_sync(h->alr)) {
+        if (alr_send_sync(h->alr, now_ms)) {
             int leader = raft_get_leader_id(h->raft);
             if (leader >= 0) {
                 uint64_t term = raft_get_term(h->raft);

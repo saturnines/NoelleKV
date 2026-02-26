@@ -117,9 +117,11 @@ lygus_err_t alr_read(alr_t *alr, const void *key, size_t klen,
  * are reads to sync (caller should send MSG_FOLLOWER_SYNC_REQ).
  * Returns false if no pending reads or a sync is already active.
  *
+ * @param now_ms  Current time — used for sync-level timeout (Fix #2).
+ *
  * Maps to TLA+ FollowerSendSync.
  */
-bool alr_send_sync(alr_t *alr);
+bool alr_send_sync(alr_t *alr, uint64_t now_ms);
 
 /**
  * Leader responded with max_acked_seq.
@@ -149,6 +151,14 @@ void alr_notify_seq(alr_t *alr, uint64_t seq);
  * Maps to TLA+ FollowerSyncTimeout + election cleanup.
  */
 void alr_flush(alr_t *alr, lygus_err_t err);
+
+/**
+ * Fix #4: Flush only the in-flight sync batch, keeping pending reads.
+ * Use on term change — pending reads can join the next sync.
+ *
+ * Maps to TLA+ FollowerSyncTimeout (batch only).
+ */
+void alr_flush_sync(alr_t *alr, lygus_err_t err);
 
 /**
  * Cancel all reads for a disconnected client.

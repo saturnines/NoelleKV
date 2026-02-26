@@ -27,6 +27,7 @@ struct conn {
     event_loop_t      *loop;
     lygus_socket_t     sock;
     conn_state_t       state;
+    bool               in_callback;
 
     char               addr[64];
 
@@ -135,11 +136,18 @@ static void process_lines(conn_t *c) {
         }
 
         if (c->on_message && line_len > 0) {
+            c->in_callback = true;
             c->on_message(c, line_start, line_len, c->ctx);
-        }
+            c->in_callback = false;
 
-        // Check if connection was closed during callback
-        if (c->state == CONN_STATE_CLOSED) return;
+            if (c->state == CONN_STATE_CLOSED) {
+                conn_on_close_fn on_close = c->on_close;
+                void *ctx = c->ctx;
+                if (on_close) on_close(c, ctx);
+                conn_destroy(c);
+                return;
+            }
+        }
 
         line_start = newline + 1;
     }
@@ -317,11 +325,14 @@ void conn_close(conn_t *c) {
 
 void conn_close_now(conn_t *c) {
     if (!c) return;
+    if (c->state == CONN_STATE_CLOSED) return;
+
+    c->state = CONN_STATE_CLOSED;
+
+    if (c->in_callback) return;
 
     conn_on_close_fn on_close = c->on_close;
     void *ctx = c->ctx;
-
-    c->state = CONN_STATE_CLOSED;
 
     if (on_close) {
         on_close(c, ctx);

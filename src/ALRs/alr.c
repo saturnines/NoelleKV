@@ -1,21 +1,3 @@
-/**
- * alr.c - Frontier Follower Reads (Lazy-ALR via Ack Stream)
- *
- *   pending[]  = followerPendingReads  — reads waiting for next sync
- *   batch[]    = followerSyncBatch     — reads in current sync (closed)
- *   sync_target = followerSyncTarget   — max_acked_seq, 0 = inactive
- *
- * Prefix tracker:
- *   leader_seq = (term << 32) | counter.  Counters are dense across
- *   terms because sync_complete reconstructs from max existing.
- *   We track the contiguous prefix over the counter (lower 32 bits).
- *   Gap buffer handles out-of-order ff-push delivery.
- *
- * Memory layout:
- *   Two flat arrays (pending, batch) swapped on send_sync.
- *   Keys live in a bump-allocated slab, reset when both arrays empty.
- */
-
 #include "alr.h"
 
 #include <stdlib.h>
@@ -65,6 +47,7 @@ struct alr {
     // --- Sync state ---
     bool     sync_in_flight;        // SYNC_REQ sent, waiting for response
     uint64_t sync_target;           // full leader_seq target (0 = waiting)
+    uint64_t sync_deadline_ms;      // Fix #2: timeout for sync response
 
     // --- Contiguous prefix tracker ---
     //
@@ -246,7 +229,7 @@ lygus_err_t alr_read(alr_t *alr, const void *key, size_t klen,
 // Core: Close batch and mark sync as in-flight
 // ============================================================================
 
-bool alr_send_sync(alr_t *alr) {
+bool alr_send_sync(alr_t *alr, uint64_t now_ms) {
     if (!alr) return false;
     if (alr->pending_count == 0) return false;
     if (alr->sync_in_flight) return false;
@@ -263,6 +246,7 @@ bool alr_send_sync(alr_t *alr) {
 
     alr->sync_in_flight = true;
     alr->sync_target = 0;  // waiting for leader response
+    alr->sync_deadline_ms = now_ms + alr->timeout_ms;  // Fix #2
 
     alr->stats.syncs_sent++;
     return true;
@@ -362,9 +346,31 @@ void alr_flush(alr_t *alr, lygus_err_t err) {
     alr->sync_target = 0;
     alr->slab_cursor = 0;
 
-    // Don't reset prefix — counters are dense across terms,
-    // so the prefix remains valid.  The sync target is cleared,
-    // so the prefix gate won't fire until the next sync.
+    alr->prefix = 0;
+    alr->gap_count = 0;
+}
+
+void alr_flush_sync(alr_t *alr, lygus_err_t err) {
+    if (!alr) return;
+
+
+    for (uint16_t i = 0; i < alr->batch_count; i++) {
+        alr_read_entry_t *r = &alr->batch[i];
+        if (!r->cancelled && r->conn) {
+            alr->serve(r->conn, r->key, r->klen, 0, err, alr->serve_ctx);
+            alr->stats.reads_failed++;
+        }
+    }
+    alr->batch_count = 0;
+
+    alr->sync_in_flight = false;
+    alr->sync_target = 0;
+
+
+    alr->prefix = 0;
+    alr->gap_count = 0;
+
+    maybe_reset_slab(alr);
 }
 
 // ============================================================================
@@ -403,6 +409,12 @@ int alr_cancel_conn(alr_t *alr, void *conn) {
 int alr_timeout_sweep(alr_t *alr, uint64_t now_ms) {
     if (!alr) return 0;
     int expired = 0;
+
+    if (alr->sync_in_flight && alr->sync_target == 0
+        && now_ms >= alr->sync_deadline_ms) {
+        complete_batch(alr, LYGUS_ERR_TIMEOUT);
+        /* Don't return — still sweep pending for individual timeouts */
+    }
 
     for (uint16_t i = 0; i < alr->pending_count; i++) {
         alr_read_entry_t *r = &alr->pending[i];
