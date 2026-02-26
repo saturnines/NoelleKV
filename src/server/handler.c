@@ -37,7 +37,7 @@
 #define ENTRY_BUF_SIZE           (1024 * 1024 + 1024)
 
 #define DEFAULT_DAG_MAX_NODES    65536
-#define DEFAULT_DAG_ARENA_SIZE   (16 * 1024 * 1024)
+#define DEFAULT_DAG_ARENA_SIZE   (64 * 1024 * 1024) // was 16 not
 #define DEFAULT_BATCH_BUF_SIZE   (8 * 1024 * 1024)
 
 #define MAX_TIP_PARENTS          8
