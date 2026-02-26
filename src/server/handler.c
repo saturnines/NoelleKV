@@ -1423,6 +1423,14 @@ void handler_on_gossip(handler_t *h, int from_peer, uint8_t msg_type,
         memcpy(&max_seq, data, 8);
 
         alr_recv_sync(h->alr, max_seq);
+
+        // Seed prefix tracker from existing DAG state.
+        dag_node_t *node, *tmp;
+        HASH_ITER(hh, h->dag->nodes, node, tmp) {
+            if (node->leader_seq > 0) {
+                alr_notify_seq(h->alr, node->leader_seq);
+            }
+        }
         return;
     }
 
