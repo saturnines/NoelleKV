@@ -77,16 +77,6 @@ typedef struct {
 } pending_write_entry_t;
 
 // ============================================================================
-// Push Hash Entry — O(1) lookup for push ACKs
-// ============================================================================
-
-typedef struct {
-    uint8_t         hash[DAG_HASH_SIZE];   /* uthash key */
-    int             push_idx;              /* index into pushes[] */
-    UT_hash_handle  hh;
-} push_hash_entry_t;
-
-// ============================================================================
 // Frontier Read - pending read awaiting quorum ping
 // ============================================================================
 
@@ -146,15 +136,10 @@ struct handler {
     uint64_t         next_push_seq;
     int              ack_threshold;  // ff-acks needed: (num_peers/2) for N>=5, 1 for N=3
 
-    // O(1) push lookup by hash + freelist
-    push_hash_entry_t *push_hash;
-    int                push_freelist[MAX_PENDING_PUSHES];
-    int                push_free_top;  // -1 = empty
-
-    // O(1) pending leader write lookup
+    // O(1) pending leader write lookup (Fix #1)
     pending_write_entry_t *pending_writes;
 
-    // Incremental max_acked_seq
+    // Incremental max_acked_seq (Fix #2)
     uint64_t         max_acked_seq;
 
     // Background drain tick counter
@@ -221,18 +206,17 @@ static dag_node_t *find_latest_up_to(handler_t *h,
                                       uint64_t max_seq);
 
 // ============================================================================
-// Confirmed Push Helpers — O(1) freelist + hash lookup
+// Confirmed Push Helpers
 // ============================================================================
 
 static pending_push_t *push_alloc(handler_t *h) {
-    if (h->push_free_top < 0) return NULL;
-    int idx = h->push_freelist[h->push_free_top--];
-    return &h->pushes[idx];
+    for (int i = 0; i < MAX_PENDING_PUSHES; i++) {
+        if (!h->pushes[i].active) return &h->pushes[i];
+    }
+    return NULL;
 }
 
 static pending_push_t *push_find(handler_t *h, uint64_t seq) {
-    // Follower confirmed pushes use seq, not hash — still linear
-    // but only hits non-leader-write entries which are rare under load
     for (int i = 0; i < MAX_PENDING_PUSHES; i++) {
         if (h->pushes[i].active && !h->pushes[i].is_leader_write
             && h->pushes[i].seq == seq)
@@ -242,10 +226,12 @@ static pending_push_t *push_find(handler_t *h, uint64_t seq) {
 }
 
 static pending_push_t *push_find_by_hash(handler_t *h, const uint8_t *hash) {
-    push_hash_entry_t *entry = NULL;
-    HASH_FIND(hh, h->push_hash, hash, DAG_HASH_SIZE, entry);
-    if (!entry) return NULL;
-    return &h->pushes[entry->push_idx];
+    for (int i = 0; i < MAX_PENDING_PUSHES; i++) {
+        if (h->pushes[i].active
+            && memcmp(h->pushes[i].hash, hash, DAG_HASH_SIZE) == 0)
+            return &h->pushes[i];
+    }
+    return NULL;
 }
 
 // ============================================================================
@@ -270,6 +256,7 @@ static void pending_write_remove(handler_t *h, const uint8_t *hash) {
     HASH_FIND(hh, h->pending_writes, hash, DAG_HASH_SIZE, entry);
     if (!entry) return;
 
+    /* Fix #2: update max_acked_seq on confirmation */
     if (entry->leader_seq > h->max_acked_seq) {
         h->max_acked_seq = entry->leader_seq;
     }
@@ -288,42 +275,19 @@ static void pending_write_clear(handler_t *h) {
 }
 
 // ============================================================================
-// Push Remove (maintains push hash + pending write set + freelist)
+// Push Remove (updated — maintains pending write set + max_acked_seq)
 // ============================================================================
 
 static void push_remove(handler_t *h, pending_push_t *pp) {
     if (pp->is_leader_write) {
         pending_write_remove(h, pp->hash);
     }
-
-    // Remove from push hash
-    push_hash_entry_t *he = NULL;
-    HASH_FIND(hh, h->push_hash, pp->hash, DAG_HASH_SIZE, he);
-    if (he) {
-        HASH_DEL(h->push_hash, he);
-        free(he);
-    }
-
-    // Return slot to freelist
-    int idx = (int)(pp - h->pushes);
-    h->push_freelist[++h->push_free_top] = idx;
-
     pp->active = false;
     pp->conn = NULL;
     pp->seq = 0;
     pp->is_leader_write = false;
     pp->ack_count = 0;
     memset(pp->hash, 0, DAG_HASH_SIZE);
-}
-
-// Helper: register a push in the hash table after activation
-static void push_hash_add(handler_t *h, pending_push_t *pp) {
-    push_hash_entry_t *he = malloc(sizeof(*he));
-    if (he) {
-        memcpy(he->hash, pp->hash, DAG_HASH_SIZE);
-        he->push_idx = (int)(pp - h->pushes);
-        HASH_ADD(hh, h->push_hash, hash, DAG_HASH_SIZE, he);
-    }
 }
 
 // ============================================================================
@@ -446,12 +410,6 @@ static void frontier_serve_one(handler_t *h, pending_frontier_read_t *r) {
  * Quorum ping succeeded — serve all queued reads and reset.
  */
 static void frontier_serve_all(handler_t *h) {
-    int queued = 0;
-    for (int i = 0; i < MAX_PENDING_FRONTIER_READS; i++) {
-        if (h->frontier_reads[i].active) queued++;
-    }
-    if (queued > 0) fprintf(stderr, "[read] serving %d queued reads\n", queued);
-
     for (int i = 0; i < MAX_PENDING_FRONTIER_READS; i++) {
         if (h->frontier_reads[i].active) {
             frontier_serve_one(h, &h->frontier_reads[i]);
@@ -793,13 +751,6 @@ handler_t *handler_create(const handler_config_t *cfg) {
     h->pending_writes = NULL;
     h->max_acked_seq = 0;
 
-    // O(1) push hash + freelist
-    h->push_hash = NULL;
-    h->push_free_top = MAX_PENDING_PUSHES - 1;
-    for (int i = 0; i < MAX_PENDING_PUSHES; i++) {
-        h->push_freelist[i] = i;
-    }
-
     size_t max_key = cfg->max_key_size > 0 ? cfg->max_key_size : DEFAULT_MAX_KEY;
     size_t max_val = cfg->max_value_size > 0 ? cfg->max_value_size : DEFAULT_MAX_VALUE;
     h->proto = protocol_ctx_create(max_key, max_val);
@@ -871,13 +822,6 @@ void handler_destroy(handler_t *h) {
 
     for (int i = 0; i < MAX_PENDING_PUSHES; i++) {
         if (h->pushes[i].active) push_remove(h, &h->pushes[i]);
-    }
-
-    // Free any remaining push hash entries
-    push_hash_entry_t *phe, *phe_tmp;
-    HASH_ITER(hh, h->push_hash, phe, phe_tmp) {
-        HASH_DEL(h->push_hash, phe);
-        free(phe);
     }
 
     // Clean up frontier reads (no response — we're shutting down)
@@ -1088,7 +1032,6 @@ static void push_node_to_peers_confirmed(handler_t *h, conn_t *conn, dag_node_t 
     pp->active = true;
     pp->is_leader_write = true;
     pending_write_add(h, node->hash, node->leader_seq);
-    push_hash_add(h, pp);
     return;
 
 fail:
@@ -1143,7 +1086,6 @@ static void push_node_confirmed(handler_t *h, conn_t *conn, dag_node_t *node) {
     pp->conn = conn;
     pp->deadline_ms = now + h->timeout_ms;
     pp->active = true;
-    push_hash_add(h, pp);
 
     h->stats.dag_nodes_gossiped++;
     return;
@@ -1176,7 +1118,20 @@ static void handle_status(handler_t *h, conn_t *conn) {
     if (n > 0) conn_send(conn, h->resp_buf, (size_t)n);
 }
 
-
+/**
+ * GET handler — FRONTIER read path.
+ *
+ * Leader path (quorum ping):
+ *   1. Stash conn + key in pending frontier reads
+ *   2. If no quorum ping in flight → start one
+ *   3. On majority ACK → frontier_serve_all
+ *
+ * Follower path (Lazy-ALR):
+ *   1. Queue read in ALR (pending batch)
+ *   2. If no sync in flight → close batch, send SYNC_REQ
+ *   3. Leader responds with max_acked_seq
+ *   4. Prefix gate clears → serve batch
+ */
 static void handle_get(handler_t *h, conn_t *conn, const request_t *req) {
     h->stats.reads_total++;
 
@@ -1268,15 +1223,21 @@ static void handle_put(handler_t *h, conn_t *conn, const request_t *req) {
         pc = (uint32_t)tc;
     }
 
-    // Stack-alloc tagged value (bounded by max_value)
     size_t tvl = 1 + req->vlen;
-    uint8_t tv[tvl];
+    uint8_t *tv = malloc(tvl);
+    if (!tv) {
+        int n = protocol_fmt_error(h->resp_buf, RESPONSE_BUF_SIZE, "alloc failed");
+        if (n > 0) conn_send(conn, h->resp_buf, (size_t)n);
+        h->stats.requests_error++;
+        return;
+    }
     tv[0] = DAG_OP_PUT;
     memcpy(tv + 1, req->value, req->vlen);
 
     size_t ab = arena_used(h->dag->arena);
     dag_node_t *node = dag_add(h->dag, req->key, req->klen,
                                 tv, tvl, pc > 0 ? tb : NULL, pc);
+    free(tv);
 
     if (!node) {
         int n = protocol_fmt_error(h->resp_buf, RESPONSE_BUF_SIZE, "dag full");
@@ -1520,6 +1481,7 @@ void handler_on_gossip(handler_t *h, int from_peer, uint8_t msg_type,
         memcpy(&max_seq, data, 8);
 
         alr_recv_sync(h->alr, max_seq);
+
 
         // Seed prefix tracker from existing DAG state.
         dag_node_t *node, *tmp;
