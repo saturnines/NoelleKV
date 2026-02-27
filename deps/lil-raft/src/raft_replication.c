@@ -333,10 +333,12 @@ int raft_propose(raft_t *r, const void *data, size_t len) {
         }
     }
 
-    // Fsync helper
-    if (r->callbacks.log_fsync) {
+    // Fsync (skipped for drain proposals — durability comes from
+    // bilateral replication + DAG sync on recovery)
+    if (r->callbacks.log_fsync && !r->skip_next_fsync) {
         r->callbacks.log_fsync(r->callback_ctx);
     }
+    r->skip_next_fsync = false;
 
     // Update own match_index
     r->peers[r->my_id].match_index = index;
@@ -402,9 +404,10 @@ int raft_propose_batch(raft_t *r,
     }
 
     // Fsync once for entire batch
-    if (r->callbacks.log_fsync) {
+    if (r->callbacks.log_fsync && !r->skip_next_fsync) {
         r->callbacks.log_fsync(r->callback_ctx);
     }
+    r->skip_next_fsync = false;
 
     // Update own match_index
     r->peers[r->my_id].match_index = last_index;
@@ -472,4 +475,8 @@ int raft_propose_noop(raft_t *r, uint64_t *sync_index) {
     *sync_index = index;
 
     return RAFT_OK;
+}
+
+void raft_skip_next_fsync(raft_t *r) {
+    if (r) r->skip_next_fsync = true;
 }

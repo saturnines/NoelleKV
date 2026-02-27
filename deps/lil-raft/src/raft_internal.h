@@ -9,6 +9,7 @@
 
 #include "raft.h"
 #include "raft_types.h"
+#include <stdbool.h>
 #include <stdint.h>
 #include <stdlib.h>
 #include <time.h>
@@ -137,6 +138,12 @@ struct raft {
 
     // Flags
     int shutdown;
+
+    /* Skip fsync on next propose call. Set by drain (propose_dag_batch) to
+     * avoid redundant fsync — drain batches inherit durability from bilateral
+     * replication + DAG sync on recovery, not per-write WAL fsync.
+     * Automatically cleared after each propose. */
+    bool skip_next_fsync;
 };
 
 // ============================================================================

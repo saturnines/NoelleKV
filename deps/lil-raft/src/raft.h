@@ -150,6 +150,9 @@ int raft_get_node_id(const raft_t *r);
  */
 uint64_t raft_get_time_ms(void);
 
+
+    void raft_skip_next_fsync(raft_t *r);
+
 #ifdef __cplusplus
 }
 #endif

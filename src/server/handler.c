@@ -905,6 +905,7 @@ static uint64_t propose_dag_batch(handler_t *h) {
     if (bc == 0) { free(excl); free(ser_hashes); return 0; }
 
     size_t el = 1 + (size_t)bl;
+    raft_skip_next_fsync(h->raft);
     int ret = raft_propose(h->raft, h->batch_buf, el);
     if (ret != 0) { free(excl); free(ser_hashes); return 0; }
 
