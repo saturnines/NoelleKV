@@ -42,7 +42,7 @@
 
 #define MAX_TIP_PARENTS          8
 #define MAX_PENDING_PUSHES       4096
-#define DRAIN_INTERVAL_TICKS     1
+#define DRAIN_INTERVAL_TICKS     5
 
 // Frontier read path
 #define MAX_PENDING_FRONTIER_READS  2048
