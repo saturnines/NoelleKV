@@ -56,7 +56,7 @@
 // Confirmed Push - pending write awaiting acknowledgement
 // ============================================================================
 
-typedef struct {
+typedef struct pending_push {
     uint64_t    seq;
     uint8_t     hash[DAG_HASH_SIZE];
     conn_t     *conn;
@@ -64,6 +64,9 @@ typedef struct {
     bool        active;
     bool        is_leader_write;
     int         ack_count;          // ff-acks received (N>=5 quorum)
+    int         next_free;          // free-list chain (-1 = end)
+    UT_hash_handle hh_hash;         // O(1) lookup by hash
+    UT_hash_handle hh_seq;          // O(1) lookup by seq (follower only)
 } pending_push_t;
 
 // ============================================================================
@@ -135,6 +138,9 @@ struct handler {
     pending_push_t   pushes[MAX_PENDING_PUSHES];
     uint64_t         next_push_seq;
     int              ack_threshold;  // ff-acks needed: (num_peers/2) for N>=5, 1 for N=3
+    int              push_free_head;    // free-list head (-1 = full)
+    pending_push_t  *push_by_hash;     // uthash: hash -> push (all pushes)
+    pending_push_t  *push_by_seq;      // uthash: seq -> push (follower only)
 
     // O(1) pending leader write lookup (Fix #1)
     pending_write_entry_t *pending_writes;
@@ -210,28 +216,23 @@ static dag_node_t *find_latest_up_to(handler_t *h,
 // ============================================================================
 
 static pending_push_t *push_alloc(handler_t *h) {
-    for (int i = 0; i < MAX_PENDING_PUSHES; i++) {
-        if (!h->pushes[i].active) return &h->pushes[i];
-    }
-    return NULL;
+    if (h->push_free_head < 0) return NULL;
+    pending_push_t *pp = &h->pushes[h->push_free_head];
+    h->push_free_head = pp->next_free;
+    pp->next_free = -1;
+    return pp;
 }
 
 static pending_push_t *push_find(handler_t *h, uint64_t seq) {
-    for (int i = 0; i < MAX_PENDING_PUSHES; i++) {
-        if (h->pushes[i].active && !h->pushes[i].is_leader_write
-            && h->pushes[i].seq == seq)
-            return &h->pushes[i];
-    }
-    return NULL;
+    pending_push_t *pp = NULL;
+    HASH_FIND(hh_seq, h->push_by_seq, &seq, sizeof(uint64_t), pp);
+    return pp;
 }
 
 static pending_push_t *push_find_by_hash(handler_t *h, const uint8_t *hash) {
-    for (int i = 0; i < MAX_PENDING_PUSHES; i++) {
-        if (h->pushes[i].active
-            && memcmp(h->pushes[i].hash, hash, DAG_HASH_SIZE) == 0)
-            return &h->pushes[i];
-    }
-    return NULL;
+    pending_push_t *pp = NULL;
+    HASH_FIND(hh_hash, h->push_by_hash, hash, DAG_HASH_SIZE, pp);
+    return pp;
 }
 
 // ============================================================================
@@ -282,12 +283,24 @@ static void push_remove(handler_t *h, pending_push_t *pp) {
     if (pp->is_leader_write) {
         pending_write_remove(h, pp->hash);
     }
+
+    /* Remove from hash tables */
+    HASH_DELETE(hh_hash, h->push_by_hash, pp);
+    if (!pp->is_leader_write) {
+        HASH_DELETE(hh_seq, h->push_by_seq, pp);
+    }
+
     pp->active = false;
     pp->conn = NULL;
     pp->seq = 0;
     pp->is_leader_write = false;
     pp->ack_count = 0;
     memset(pp->hash, 0, DAG_HASH_SIZE);
+
+    /* Return to free list */
+    int idx = (int)(pp - h->pushes);
+    pp->next_free = h->push_free_head;
+    h->push_free_head = idx;
 }
 
 // ============================================================================
@@ -751,6 +764,15 @@ handler_t *handler_create(const handler_config_t *cfg) {
     h->pending_writes = NULL;
     h->max_acked_seq = 0;
 
+    // O(1) push tracking — free list + hash tables
+    h->push_by_hash = NULL;
+    h->push_by_seq = NULL;
+    for (int i = 0; i < MAX_PENDING_PUSHES - 1; i++) {
+        h->pushes[i].next_free = i + 1;
+    }
+    h->pushes[MAX_PENDING_PUSHES - 1].next_free = -1;
+    h->push_free_head = 0;
+
     size_t max_key = cfg->max_key_size > 0 ? cfg->max_key_size : DEFAULT_MAX_KEY;
     size_t max_val = cfg->max_value_size > 0 ? cfg->max_value_size : DEFAULT_MAX_VALUE;
     h->proto = protocol_ctx_create(max_key, max_val);
@@ -928,24 +950,18 @@ static uint64_t propose_dag_batch(handler_t *h) {
     size_t count = dag_count(h->dag);
     if (count == 0) return 0;
 
-    // Build exclusion list (pending leader writes)
+    // Build exclusion list from O(1) pending_writes hash (leader writes only)
     uint8_t *excl = NULL;
-    size_t ec = 0;
-
-    for (int i = 0; i < MAX_PENDING_PUSHES; i++) {
-        if (h->pushes[i].active && h->pushes[i].is_leader_write) ec++;
-    }
+    size_t ec = HASH_COUNT(h->pending_writes);
 
     if (ec > 0) {
         excl = malloc(ec * DAG_HASH_SIZE);
         if (!excl) return 0;
         size_t idx = 0;
-        for (int i = 0; i < MAX_PENDING_PUSHES; i++) {
-            if (h->pushes[i].active && h->pushes[i].is_leader_write) {
-                memcpy(excl + (idx * DAG_HASH_SIZE),
-                       h->pushes[i].hash, DAG_HASH_SIZE);
-                idx++;
-            }
+        pending_write_entry_t *pw, *pw_tmp;
+        HASH_ITER(hh, h->pending_writes, pw, pw_tmp) {
+            memcpy(excl + (idx * DAG_HASH_SIZE), pw->hash, DAG_HASH_SIZE);
+            idx++;
         }
     }
 
@@ -1031,6 +1047,8 @@ static void push_node_to_peers_confirmed(handler_t *h, conn_t *conn, dag_node_t 
     pp->deadline_ms = now + h->timeout_ms;
     pp->active = true;
     pp->is_leader_write = true;
+    pp->ack_count = 0;
+    HASH_ADD(hh_hash, h->push_by_hash, hash, DAG_HASH_SIZE, pp);
     pending_write_add(h, node->hash, node->leader_seq);
     return;
 
@@ -1086,6 +1104,10 @@ static void push_node_confirmed(handler_t *h, conn_t *conn, dag_node_t *node) {
     pp->conn = conn;
     pp->deadline_ms = now + h->timeout_ms;
     pp->active = true;
+    pp->is_leader_write = false;
+    pp->ack_count = 0;
+    HASH_ADD(hh_hash, h->push_by_hash, hash, DAG_HASH_SIZE, pp);
+    HASH_ADD(hh_seq, h->push_by_seq, seq, sizeof(uint64_t), pp);
 
     h->stats.dag_nodes_gossiped++;
     return;
@@ -1224,20 +1246,18 @@ static void handle_put(handler_t *h, conn_t *conn, const request_t *req) {
     }
 
     size_t tvl = 1 + req->vlen;
-    uint8_t *tv = malloc(tvl);
-    if (!tv) {
-        int n = protocol_fmt_error(h->resp_buf, RESPONSE_BUF_SIZE, "alloc failed");
+    if (tvl > ENTRY_BUF_SIZE) {
+        int n = protocol_fmt_error(h->resp_buf, RESPONSE_BUF_SIZE, "value too large");
         if (n > 0) conn_send(conn, h->resp_buf, (size_t)n);
         h->stats.requests_error++;
         return;
     }
-    tv[0] = DAG_OP_PUT;
-    memcpy(tv + 1, req->value, req->vlen);
+    h->entry_buf[0] = DAG_OP_PUT;
+    memcpy(h->entry_buf + 1, req->value, req->vlen);
 
     size_t ab = arena_used(h->dag->arena);
     dag_node_t *node = dag_add(h->dag, req->key, req->klen,
-                                tv, tvl, pc > 0 ? tb : NULL, pc);
-    free(tv);
+                                h->entry_buf, tvl, pc > 0 ? tb : NULL, pc);
 
     if (!node) {
         int n = protocol_fmt_error(h->resp_buf, RESPONSE_BUF_SIZE, "dag full");
