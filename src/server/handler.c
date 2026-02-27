@@ -37,12 +37,12 @@
 #define ENTRY_BUF_SIZE           (1024 * 1024 + 1024)
 
 #define DEFAULT_DAG_MAX_NODES    65536
-#define DEFAULT_DAG_ARENA_SIZE   (64 * 1024 * 1024) // was 16 not
+#define DEFAULT_DAG_ARENA_SIZE   (256 * 1024 * 1024)
 #define DEFAULT_BATCH_BUF_SIZE   (8 * 1024 * 1024)
 
 #define MAX_TIP_PARENTS          8
 #define MAX_PENDING_PUSHES       4096
-#define DRAIN_INTERVAL_TICKS     2 // was 10
+#define DRAIN_INTERVAL_TICKS     10
 
 // Frontier read path
 #define MAX_PENDING_FRONTIER_READS  2048
@@ -867,6 +867,7 @@ static uint64_t propose_dag_batch(handler_t *h) {
     size_t count = dag_count(h->dag);
     if (count == 0) return 0;
 
+    // Build exclusion list (pending leader writes)
     uint8_t *excl = NULL;
     size_t ec = 0;
 
@@ -876,49 +877,43 @@ static uint64_t propose_dag_batch(handler_t *h) {
 
     if (ec > 0) {
         excl = malloc(ec * DAG_HASH_SIZE);
-        if (excl) {
-            size_t idx = 0;
-            for (int i = 0; i < MAX_PENDING_PUSHES; i++) {
-                if (h->pushes[i].active && h->pushes[i].is_leader_write) {
-                    memcpy(excl + (idx * DAG_HASH_SIZE),
-                           h->pushes[i].hash, DAG_HASH_SIZE);
-                    idx++;
-                }
+        if (!excl) return 0;
+        size_t idx = 0;
+        for (int i = 0; i < MAX_PENDING_PUSHES; i++) {
+            if (h->pushes[i].active && h->pushes[i].is_leader_write) {
+                memcpy(excl + (idx * DAG_HASH_SIZE),
+                       h->pushes[i].hash, DAG_HASH_SIZE);
+                idx++;
             }
-        } else {
-            return 0;
         }
     }
+
+    // Serialize + collect hashes in one pass
+    uint8_t *ser_hashes = malloc(2000 * DAG_HASH_SIZE);
+    size_t ser_count = 0;
 
     h->batch_buf[0] = DAG_ENTRY_MARKER;
     ssize_t bl = dag_serialize_batch_excluding(
-        h->dag, h->batch_buf + 1, h->batch_buf_cap - 1, excl, ec, 1000);
+        h->dag, h->batch_buf + 1, h->batch_buf_cap - 1,
+        excl, ec, 2000,
+        ser_hashes, &ser_count);
 
-    if (bl < 0) { free(excl); return 0; }
+    if (bl < 0) { free(excl); free(ser_hashes); return 0; }
 
     uint32_t bc;
     memcpy(&bc, h->batch_buf + 1, 4);
-    if (bc == 0) { free(excl); return 0; }
+    if (bc == 0) { free(excl); free(ser_hashes); return 0; }
 
     size_t el = 1 + (size_t)bl;
     int ret = raft_propose(h->raft, h->batch_buf, el);
-    if (ret != 0) { free(excl); return 0; }
+    if (ret != 0) { free(excl); free(ser_hashes); return 0; }
 
-    // Remove proposed nodes from live DAG
-    dag_reset(h->apply_dag);
-    int proposed = dag_deserialize_batch(h->apply_dag,
-                                          h->batch_buf + 1, (size_t)bl);
-    if (proposed > 0) {
-        size_t pc = dag_count(h->apply_dag);
-        uint8_t *ph = malloc(pc * DAG_HASH_SIZE);
-        if (ph) {
-            pc = dag_collect_hashes(h->apply_dag, ph, pc);
-            dag_remove_by_hashes(h->dag, ph, pc);
-            free(ph);
-        }
+    // Remove exactly what was serialized — one hash lookup per node, no deser
+    if (ser_count > 0) {
+        dag_remove_by_hashes(h->dag, ser_hashes, ser_count);
     }
-    dag_reset(h->apply_dag);
 
+    free(ser_hashes);
     free(excl);
     h->stats.dag_batches_proposed++;
     return raft_get_pending_index(h->raft);
@@ -1423,6 +1418,7 @@ void handler_on_gossip(handler_t *h, int from_peer, uint8_t msg_type,
         memcpy(&max_seq, data, 8);
 
         alr_recv_sync(h->alr, max_seq);
+
 
         // Seed prefix tracker from existing DAG state.
         dag_node_t *node, *tmp;
