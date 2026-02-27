@@ -42,7 +42,7 @@
 
 #define MAX_TIP_PARENTS          8
 #define MAX_PENDING_PUSHES       4096
-#define DRAIN_INTERVAL_TICKS     10
+#define DRAIN_INTERVAL_TICKS     1
 
 // Frontier read path
 #define MAX_PENDING_FRONTIER_READS  2048
@@ -254,7 +254,7 @@ static bool is_pending_leader_write(handler_t *h, const uint8_t *hash) {
  *
  * Fast path: dag_get_latest is O(1).  This O(n) scan only runs
  * when the winner is pending — rare, and DAG size between drains
- * is bounded by the 200-node batch cap.
+ * is bounded by the 2000-node batch cap.
  */
 static dag_node_t *find_latest_safe(handler_t *h,
                                      const uint8_t *key, size_t key_len) {
