@@ -410,6 +410,13 @@ static void frontier_serve_one(handler_t *h, pending_frontier_read_t *r) {
  * Quorum ping succeeded — serve all queued reads and reset.
  */
 static void frontier_serve_all(handler_t *h) {
+    int queued = 0;
+    for (int i = 0; i < MAX_PENDING_FRONTIER_READS; i++) {
+        if (h->frontier_reads[i].active) queued++;
+    }
+    if (queued > 0) fprintf(stderr, "[read] serving %d queued reads\n", queued);
+
+
     for (int i = 0; i < MAX_PENDING_FRONTIER_READS; i++) {
         if (h->frontier_reads[i].active) {
             frontier_serve_one(h, &h->frontier_reads[i]);
