@@ -67,6 +67,16 @@ typedef struct {
 } pending_push_t;
 
 // ============================================================================
+// Pending Write Hash Set — O(1) lookup for safeWrites filter
+// ============================================================================
+
+typedef struct {
+    uint8_t         hash[DAG_HASH_SIZE];   /* uthash key */
+    uint64_t        leader_seq;            /* cached for incremental max_acked_seq */
+    UT_hash_handle  hh;
+} pending_write_entry_t;
+
+// ============================================================================
 // Frontier Read - pending read awaiting quorum ping
 // ============================================================================
 
@@ -125,6 +135,12 @@ struct handler {
     pending_push_t   pushes[MAX_PENDING_PUSHES];
     uint64_t         next_push_seq;
     int              ack_threshold;  // ff-acks needed: (num_peers/2) for N>=5, 1 for N=3
+
+    // O(1) pending leader write lookup
+    pending_write_entry_t *pending_writes;
+
+    // Incremental max_acked_seq
+    uint64_t         max_acked_seq;
 
     // Background drain tick counter
     uint64_t         drain_tick_count;
@@ -218,7 +234,54 @@ static pending_push_t *push_find_by_hash(handler_t *h, const uint8_t *hash) {
     return NULL;
 }
 
-static void push_remove(pending_push_t *pp) {
+// ============================================================================
+// Pending Write Hash Set Helpers
+// ============================================================================
+
+static void pending_write_add(handler_t *h, const uint8_t *hash,
+                              uint64_t leader_seq) {
+    pending_write_entry_t *entry = NULL;
+    HASH_FIND(hh, h->pending_writes, hash, DAG_HASH_SIZE, entry);
+    if (entry) return;
+
+    entry = malloc(sizeof(*entry));
+    if (!entry) return;
+    memcpy(entry->hash, hash, DAG_HASH_SIZE);
+    entry->leader_seq = leader_seq;
+    HASH_ADD(hh, h->pending_writes, hash, DAG_HASH_SIZE, entry);
+}
+
+static void pending_write_remove(handler_t *h, const uint8_t *hash) {
+    pending_write_entry_t *entry = NULL;
+    HASH_FIND(hh, h->pending_writes, hash, DAG_HASH_SIZE, entry);
+    if (!entry) return;
+
+
+    if (entry->leader_seq > h->max_acked_seq) {
+        h->max_acked_seq = entry->leader_seq;
+    }
+
+    HASH_DEL(h->pending_writes, entry);
+    free(entry);
+}
+
+static void pending_write_clear(handler_t *h) {
+    pending_write_entry_t *entry, *tmp;
+    HASH_ITER(hh, h->pending_writes, entry, tmp) {
+        HASH_DEL(h->pending_writes, entry);
+        free(entry);
+    }
+    h->pending_writes = NULL;
+}
+
+// ============================================================================
+// Push Remove (updated — maintains pending write set + max_acked_seq)
+// ============================================================================
+
+static void push_remove(handler_t *h, pending_push_t *pp) {
+    if (pp->is_leader_write) {
+        pending_write_remove(h, pp->hash);
+    }
     pp->active = false;
     pp->conn = NULL;
     pp->seq = 0;
@@ -233,19 +296,12 @@ static void push_remove(pending_push_t *pp) {
 
 /**
  * Check if a DAG node is an unconfirmed leader write.
- *
- * These are writes the leader inserted locally but no peer has ACK'd
- * yet.  The TLA+ spec excludes leaderPendingAck from safeWrites —
- * a read must not observe a write that might vanish if the leader
- * crashes before any peer receives it.
+ * O(1) hash lookup — replaces O(4096) linear scan.
  */
 static bool is_pending_leader_write(handler_t *h, const uint8_t *hash) {
-    for (int i = 0; i < MAX_PENDING_PUSHES; i++) {
-        if (h->pushes[i].active && h->pushes[i].is_leader_write
-            && memcmp(h->pushes[i].hash, hash, DAG_HASH_SIZE) == 0)
-            return true;
-    }
-    return false;
+    pending_write_entry_t *entry = NULL;
+    HASH_FIND(hh, h->pending_writes, hash, DAG_HASH_SIZE, entry);
+    return entry != NULL;
 }
 
 /**
@@ -387,21 +443,11 @@ static void frontier_fail_all(handler_t *h, const char *reason) {
 // ============================================================================
 
 /**
- * Compute max_acked_seq: highest leader_seq among writes that are
- * ordered AND not pending bilateral confirmation.
- *
- * This is the linearization point for follower reads.
- * Maps to TLA+ MaxWriteOrder(safeWrites) in LeaderProcessSync.
+ * Return max_acked_seq — O(1), maintained incrementally.
+ * Was: HASH_ITER over entire DAG. Now: just read the field.
  */
 static uint64_t leader_max_acked_seq(handler_t *h) {
-    uint64_t max_seq = 0;
-    dag_node_t *node, *tmp;
-    HASH_ITER(hh, h->dag->nodes, node, tmp) {
-        if (node->leader_seq == 0) continue;
-        if (is_pending_leader_write(h, node->hash)) continue;
-        if (node->leader_seq > max_seq) max_seq = node->leader_seq;
-    }
-    return max_seq;
+    return h->max_acked_seq;
 }
 
 /**
@@ -651,6 +697,16 @@ static void sync_complete(handler_t *h) {
         }
     }
 
+    // Reconstruct max_acked_seq from all sequenced, non-pending nodes
+    h->max_acked_seq = 0;
+    HASH_ITER(hh, h->dag->nodes, node, tmp) {
+        if (node->leader_seq > 0
+            && !is_pending_leader_write(h, node->hash)
+            && node->leader_seq > h->max_acked_seq) {
+            h->max_acked_seq = node->leader_seq;
+        }
+    }
+
     // Msync the arena if durable mode is on (sequences are in DAG node metadata)
     if (h->dag_msync_enabled && h->dag->arena) {
         dag_msync(h->dag, 0, arena_used(h->dag->arena));
@@ -690,6 +746,10 @@ handler_t *handler_create(const handler_config_t *cfg) {
     h->timeout_ms = cfg->request_timeout_ms > 0 ? cfg->request_timeout_ms : DEFAULT_TIMEOUT_MS;
     h->leader_only = cfg->leader_only_reads;
     h->dag_msync_enabled = cfg->dag_msync_enabled;
+
+    // O(1) pending write tracking
+    h->pending_writes = NULL;
+    h->max_acked_seq = 0;
 
     size_t max_key = cfg->max_key_size > 0 ? cfg->max_key_size : DEFAULT_MAX_KEY;
     size_t max_val = cfg->max_value_size > 0 ? cfg->max_value_size : DEFAULT_MAX_VALUE;
@@ -761,7 +821,7 @@ void handler_destroy(handler_t *h) {
     }
 
     for (int i = 0; i < MAX_PENDING_PUSHES; i++) {
-        if (h->pushes[i].active) push_remove(&h->pushes[i]);
+        if (h->pushes[i].active) push_remove(h, &h->pushes[i]);
     }
 
     // Clean up frontier reads (no response — we're shutting down)
@@ -775,6 +835,7 @@ void handler_destroy(handler_t *h) {
     if (h->dag) dag_destroy(h->dag);
     if (h->apply_dag) dag_destroy(h->apply_dag);
 
+    pending_write_clear(h);
     free(h->resp_buf);
     free(h->entry_buf);
     free(h->batch_buf);
@@ -970,6 +1031,7 @@ static void push_node_to_peers_confirmed(handler_t *h, conn_t *conn, dag_node_t 
     pp->deadline_ms = now + h->timeout_ms;
     pp->active = true;
     pp->is_leader_write = true;
+    pending_write_add(h, node->hash, node->leader_seq);
     return;
 
 fail:
@@ -1056,20 +1118,7 @@ static void handle_status(handler_t *h, conn_t *conn) {
     if (n > 0) conn_send(conn, h->resp_buf, (size_t)n);
 }
 
-/**
- * GET handler — FRONTIER read path.
- *
- * Leader path (quorum ping):
- *   1. Stash conn + key in pending frontier reads
- *   2. If no quorum ping in flight → start one
- *   3. On majority ACK → frontier_serve_all
- *
- * Follower path (Lazy-ALR):
- *   1. Queue read in ALR (pending batch)
- *   2. If no sync in flight → close batch, send SYNC_REQ
- *   3. Leader responds with max_acked_seq
- *   4. Prefix gate clears → serve batch
- */
+
 static void handle_get(handler_t *h, conn_t *conn, const request_t *req) {
     h->stats.reads_total++;
 
@@ -1461,7 +1510,7 @@ void handler_on_gossip(handler_t *h, int from_peer, uint8_t msg_type,
                 if (n > 0) conn_send(pp->conn, h->resp_buf, (size_t)n);
                 h->stats.requests_ok++;
             }
-            push_remove(pp);
+            push_remove(h, pp);
         }
         return;
     }
@@ -1509,7 +1558,7 @@ void handler_on_gossip(handler_t *h, int from_peer, uint8_t msg_type,
                 if (n > 0) conn_send(pp->conn, h->resp_buf, (size_t)n);
                 h->stats.requests_ok++;
             }
-            push_remove(pp);
+            push_remove(h, pp);
         }
         return;
     }
@@ -1549,8 +1598,10 @@ void handler_on_leadership_change(handler_t *h, bool is_leader) {
                 if (n > 0) conn_send(pp->conn, h->resp_buf, (size_t)n);
                 h->stats.requests_error++;
             }
-            push_remove(pp);
+            push_remove(h, pp);
         }
+
+        pending_write_clear(h);
 
         frontier_fail_all(h, "leader changed");
 
@@ -1568,6 +1619,7 @@ void handler_on_leadership_change(handler_t *h, bool is_leader) {
         // Don't set leader_seq_counter here — sync_complete will
         // reconstruct it from max existing leader_seq.
         // Don't set leader_ready here — sync_complete will.
+        h->max_acked_seq = 0;
         sync_start(h);
     }
 }
@@ -1628,7 +1680,7 @@ void handler_tick(handler_t *h, uint64_t now_ms) {
             if (n > 0) conn_send(pp->conn, h->resp_buf, (size_t)n);
             h->stats.requests_error++;
         }
-        push_remove(pp);
+        push_remove(h, pp);
     }
 
     // Sweep pending frontier reads for timeouts
