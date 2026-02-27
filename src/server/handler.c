@@ -23,6 +23,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 
 // ============================================================================
 // Defaults
@@ -947,8 +948,10 @@ int handler_apply_dag_batch(handler_t *h, const uint8_t *entry, size_t len) {
 // ============================================================================
 
 static uint64_t propose_dag_batch(handler_t *h) {
+    struct timespec _pb0, _pb1, _pb2, _pb3;
     size_t count = dag_count(h->dag);
     if (count == 0) return 0;
+    clock_gettime(CLOCK_MONOTONIC, &_pb0);
 
     // Build exclusion list from O(1) pending_writes hash (leader writes only)
     uint8_t *excl = NULL;
@@ -976,6 +979,7 @@ static uint64_t propose_dag_batch(handler_t *h) {
         ser_hashes, &ser_count);
 
     if (bl < 0) { free(excl); free(ser_hashes); return 0; }
+    clock_gettime(CLOCK_MONOTONIC, &_pb1);
 
     uint32_t bc;
     memcpy(&bc, h->batch_buf + 1, 4);
@@ -985,10 +989,23 @@ static uint64_t propose_dag_batch(handler_t *h) {
     raft_skip_next_fsync(h->raft);
     int ret = raft_propose(h->raft, h->batch_buf, el);
     if (ret != 0) { free(excl); free(ser_hashes); return 0; }
+    clock_gettime(CLOCK_MONOTONIC, &_pb2);
 
     // Remove exactly what was serialized — one hash lookup per node, no deser
     if (ser_count > 0) {
         dag_remove_by_hashes(h->dag, ser_hashes, ser_count);
+    }
+    clock_gettime(CLOCK_MONOTONIC, &_pb3);
+
+    {
+        uint64_t ser_us = (_pb1.tv_sec-_pb0.tv_sec)*1000000 + (_pb1.tv_nsec-_pb0.tv_nsec)/1000;
+        uint64_t raft_us = (_pb2.tv_sec-_pb1.tv_sec)*1000000 + (_pb2.tv_nsec-_pb1.tv_nsec)/1000;
+        uint64_t rm_us = (_pb3.tv_sec-_pb2.tv_sec)*1000000 + (_pb3.tv_nsec-_pb2.tv_nsec)/1000;
+        uint64_t total_us = ser_us + raft_us + rm_us;
+        if (total_us > 500)
+            fprintf(stderr, "DRAIN: dag=%zu batch=%u ser=%luus raft=%luus rm=%luus total=%luus\n",
+                    count, bc, (unsigned long)ser_us, (unsigned long)raft_us,
+                    (unsigned long)rm_us, (unsigned long)total_us);
     }
 
     free(ser_hashes);
@@ -1233,6 +1250,8 @@ static void handle_get(handler_t *h, conn_t *conn, const request_t *req) {
 }
 
 static void handle_put(handler_t *h, conn_t *conn, const request_t *req) {
+    struct timespec _hp0, _hp1;
+    clock_gettime(CLOCK_MONOTONIC, &_hp0);
     h->stats.writes_total++;
 
     size_t tc = dag_tip_count(h->dag);
@@ -1280,6 +1299,12 @@ static void handle_put(handler_t *h, conn_t *conn, const request_t *req) {
     } else {
         push_node_confirmed(h, conn, node);
     }
+    clock_gettime(CLOCK_MONOTONIC, &_hp1);
+    uint64_t _hp_us = (_hp1.tv_sec-_hp0.tv_sec)*1000000
+                    + (_hp1.tv_nsec-_hp0.tv_nsec)/1000;
+    if (_hp_us > 200)
+        fprintf(stderr, "HANDLE_PUT: took=%luus dag=%zu\n",
+                (unsigned long)_hp_us, dag_count(h->dag));
 }
 
 static void handle_del(handler_t *h, conn_t *conn, const request_t *req) {
@@ -1517,8 +1542,16 @@ void handler_on_gossip(handler_t *h, int from_peer, uint8_t msg_type,
 
     if (msg_type == MSG_DAG_PUSH) {
         if (data && len > 0) {
+            struct timespec _gp0, _gp1;
+            clock_gettime(CLOCK_MONOTONIC, &_gp0);
             size_t consumed = 0;
             dag_node_t *node = dag_node_deserialize(h->dag, data, len, &consumed);
+            clock_gettime(CLOCK_MONOTONIC, &_gp1);
+            uint64_t _gp_us = (_gp1.tv_sec-_gp0.tv_sec)*1000000
+                             + (_gp1.tv_nsec-_gp0.tv_nsec)/1000;
+            if (_gp_us > 100)
+                fprintf(stderr, "GOSSIP_PUSH: deser+add took=%luus dag=%zu\n",
+                        (unsigned long)_gp_us, dag_count(h->dag));
             if (node) {
                 network_send_raft(h->net, from_peer, MSG_DAG_PUSH_FF_ACK,
                                   node->hash, DAG_HASH_SIZE);
@@ -1700,6 +1733,8 @@ void handler_on_conn_close(handler_t *h, conn_t *conn) {
 
 void handler_tick(handler_t *h, uint64_t now_ms) {
     if (!h) return;
+    struct timespec _tk0, _tk1;
+    clock_gettime(CLOCK_MONOTONIC, &_tk0);
 
     pending_timeout_sweep(h->pending, now_ms);
 
@@ -1770,6 +1805,12 @@ void handler_tick(handler_t *h, uint64_t now_ms) {
             propose_dag_batch(h);
         }
     }
+    clock_gettime(CLOCK_MONOTONIC, &_tk1);
+    uint64_t _tk_us = (_tk1.tv_sec - _tk0.tv_sec) * 1000000
+                    + (_tk1.tv_nsec - _tk0.tv_nsec) / 1000;
+    if (_tk_us > 500)
+        fprintf(stderr, "TICK: took=%luus dag=%zu\n",
+                (unsigned long)_tk_us, dag_count(h->dag));
 }
 
 void handler_on_readindex_complete(handler_t *h, uint64_t req_id,
